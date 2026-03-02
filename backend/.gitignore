@@ -1,5 +1,6 @@
 venv
 test_shot*
+*.mp4
 yolov8*
 *.pt
 *.task

@@ -3,7 +3,7 @@ from ultralytics import YOLOWorld
 
 
 class BallDetector:
-    def __init__(self, model_size="yolov8x-worldv2", conf=0.25):
+    def __init__(self, model_size="yolov8x-worldv2", conf=0.15):
         """
         model_size options (larger = more accurate, slower):
           yolov8s-worldv2  — fast, good for testing
@@ -19,8 +19,13 @@ class BallDetector:
         self._last_cx    = None
         self._last_cy    = None
         self._lost_count = 0
-        self._max_lost   = 8
-        self._max_jump   = 120  # px — how far the ball can move between frames
+        self._max_lost   = 12
+        self._max_jump   = 250  # px — ball moves fast during a shot
+
+        # Minimum radius in pixels to accept a detection as a real basketball.
+        # A 6px radius blob is noise; a real ball at typical shooting distance
+        # will be at least 10px radius at 640x480.
+        self._min_radius = 10
 
     def detect_ball(self, frame):
         """
@@ -37,6 +42,10 @@ class BallDetector:
             cy = int((y1 + y2) / 2)
             r  = int(max(x2 - x1, y2 - y1) / 2)  # use bounding box to approximate radius
             area = (x2 - x1) * (y2 - y1)
+
+            # Reject tiny blobs — not a basketball
+            if r < self._min_radius:
+                continue
 
             # Temporal gate — reject detections that jump too far
             if self._last_cx is not None and self._lost_count < self._max_lost:

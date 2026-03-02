@@ -32,7 +32,11 @@ release_detector = ReleaseDetector()
 ball_detector = BallDetector()
 
 # Load video (replace with your file)
-cap = cv2.VideoCapture("test_shot.mp4")
+cap = cv2.VideoCapture("test_shot3.mp4")
+
+# Set up video writer for headless output
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+out = cv2.VideoWriter("output.mp4", fourcc, 30.0, (640, 480))
 
 while cap.isOpened():
     ret, frame = cap.read()
@@ -76,9 +80,20 @@ while cap.isOpened():
     if ball_result and landmarks:
         h, w = frame.shape[:2]
 
-        wrist = landmarks[16]  # right wrist
+        # Right-side landmarks (shooting hand)
+        wrist      = landmarks[16]
+        elbow_lm   = landmarks[14]
+        shoulder_r = landmarks[12]
+        shoulder_l = landmarks[11]
+
         wrist_x = int(wrist.x * w)
         wrist_y = int(wrist.y * h)
+        elbow_x = int(elbow_lm.x * w)
+        elbow_y = int(elbow_lm.y * h)
+        sl_x    = int(shoulder_l.x * w)
+        sl_y    = int(shoulder_l.y * h)
+        sr_x    = int(shoulder_r.x * w)
+        sr_y    = int(shoulder_r.y * h)
 
         bx, by, br = ball_result
         elbow_angle = angles['elbow_angle']
@@ -86,22 +101,29 @@ while cap.isOpened():
         # Draw wrist
         cv2.circle(frame, (wrist_x, wrist_y), 6, (0, 255, 255), -1)
 
-        is_release = release_detector.detect(
-            wrist_x, wrist_y,
+        result = release_detector.detect(
             bx, by,
-            elbow_angle
+            wrist_x, wrist_y,
+            elbow_x, elbow_y,
+            sl_x, sl_y,
+            sr_x, sr_y,
+            elbow_angle,
         )
 
-        if is_release:
-            print("🔥 RELEASE DETECTED")
-            cv2.putText(frame, "RELEASE", (50, 50),
+        # Debug overlay — state + confidence
+        conf_pct = int(result['confidence'] * 100)
+        state_str = result['state']
+        cv2.putText(frame, f"{state_str}  {conf_pct}%", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 2)
+
+        if result['release']:
+            print(f"RELEASE DETECTED  confidence={result['confidence']:.2f}  signals={result['signals']}")
+            cv2.putText(frame, "RELEASE", (50, 70),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        1.2, (0, 0, 255), 3)
+                        1.4, (0, 0, 255), 3)
 
-    cv2.imshow("PureArc Pose Test", frame)
-
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+    out.write(frame)
 
 cap.release()
-cv2.destroyAllWindows()
+out.release()
+print("Output saved to output.mp4")

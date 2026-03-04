@@ -7,3 +7,4 @@ yolov8*
 __pycache__
 *.pyc
 *.pyo
+*.png

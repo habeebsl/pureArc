@@ -1,8 +1,14 @@
 import cv2
+import os
 import math
 from pose import PoseEstimator, POSE_CONNECTIONS
 from release import ReleaseDetector
 from ball import BallDetector
+from rim import RimDetector
+from distance import estimate_distance, draw_distance_overlay
+
+# Use the custom-trained rim detector if weights exist, else fall back to YOLOWorld+HSV
+_CUSTOM_WEIGHTS = os.path.join(os.path.dirname(__file__), "runs", "rim_detector", "weights", "best.pt")
 
 
 def draw_landmarks(frame, landmarks):
@@ -30,6 +36,9 @@ def draw_landmarks(frame, landmarks):
 pose_estimator = PoseEstimator()
 release_detector = ReleaseDetector()
 ball_detector = BallDetector()
+rim_detector = RimDetector(
+    custom_model_path=_CUSTOM_WEIGHTS if os.path.exists(_CUSTOM_WEIGHTS) else None
+)
 
 # Load video (replace with your file)
 cap = cv2.VideoCapture("test_shot3.mp4")
@@ -64,6 +73,9 @@ while cap.isOpened():
         # Draw skeleton
         draw_landmarks(frame, landmarks)
 
+    # --- Rim detection (stationary; locks after a few consistent frames) ---
+    rim_result = rim_detector.detect_rim(frame)
+
     ball_result = ball_detector.detect_ball(frame)
 
     # Always draw ball detection result so we can visually verify it independently
@@ -76,6 +88,20 @@ while cap.isOpened():
         print(f"Ball detected at ({bx}, {by}) r={br}")
     else:
         print("Ball: not detected")
+
+    # --- Distance estimation (rim + pose) ---
+    dist_result = None
+    if rim_result and landmarks:
+        dist_result = estimate_distance(rim_result, landmarks, frame.shape)
+        draw_distance_overlay(frame, dist_result, rim_result)
+        if dist_result:
+            print(
+                f"Distance to rim: {dist_result['distance_m']:.2f} m  "
+                f"({dist_result['distance_ft']:.1f} ft)  "
+                f"[{dist_result['method']}]"
+            )
+    elif rim_result:
+        draw_distance_overlay(frame, None, rim_result)
 
     if ball_result and landmarks:
         h, w = frame.shape[:2]

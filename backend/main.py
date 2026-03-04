@@ -41,7 +41,7 @@ rim_detector = RimDetector(
 )
 
 # Load video (replace with your file)
-cap = cv2.VideoCapture("test_shot3.mp4")
+cap = cv2.VideoCapture("test_shot4.mp4")
 
 # Set up video writer for headless output
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')

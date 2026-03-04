@@ -1,8 +1,8 @@
 task: detect
 mode: train
-model: /workspaces/pureArc/backend/training/../runs/rim_detector/weights/last.pt
+model: yolov8m.pt
 data: /workspaces/pureArc/backend/training/prepared/rim.yaml
-epochs: 60
+epochs: 10
 time: null
 patience: 20
 batch: 8
@@ -11,7 +11,7 @@ save: true
 save_period: -1
 cache: false
 device: cpu
-workers: 0
+workers: 8
 project: /workspaces/pureArc/backend/training/../runs
 name: rim_detector
 exist_ok: true
@@ -24,7 +24,7 @@ single_cls: false
 rect: false
 cos_lr: false
 close_mosaic: 10
-resume: /workspaces/pureArc/backend/training/../runs/rim_detector/weights/last.pt
+resume: false
 amp: true
 fraction: 1.0
 profile: false
@@ -77,7 +77,7 @@ momentum: 0.937
 weight_decay: 0.0005
 warmup_epochs: 3.0
 warmup_momentum: 0.8
-warmup_bias_lr: 0.0
+warmup_bias_lr: 0.1
 box: 7.5
 cls: 0.5
 dfl: 1.5

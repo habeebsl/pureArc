@@ -1,0 +1,11 @@
+# Shot detection dataset — Basketball + Basketball Hoop (YOLOv8, 2 classes)
+# Source: https://universe.roboflow.com/034-ganesh-kumar-m-v-cs-r2lwe/basketball-lhqoe/dataset/1
+# 210 train / 60 val / 30 test images
+
+path: /workspaces/pureArc/backend/training/shot_detection_dataset
+train: train/images
+val:   valid/images
+test:  test/images
+
+nc: 2
+names: ['Basketball', 'Basketball Hoop']

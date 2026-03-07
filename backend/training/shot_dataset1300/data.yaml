@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 2
+names: ['0', '1']
+
+roboflow:
+  workspace: robocon-qchql
+  project: hoops-chrie-ivyrc
+  version: 3
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/robocon-qchql/hoops-chrie-ivyrc/dataset/3

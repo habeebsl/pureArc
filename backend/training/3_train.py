@@ -35,6 +35,7 @@ COCO_JSON = os.path.join(COCO_DIR, "_annotations.coco.json")
 PREPARED  = os.path.join(HERE, "prepared")          # YOLO-format output
 YAML_PATH = os.path.join(PREPARED, "rim.yaml")
 RUNS      = os.path.join(HERE, "..", "runs")
+BASE_WEIGHTS = os.path.join(HERE, "..", "weights", "yolov8n.pt")
 
 SEED      = 42
 VAL_SPLIT = 0.20
@@ -158,7 +159,7 @@ if args.resume and os.path.exists(LAST_CKPT):
     print(f"  Resuming from {LAST_CKPT}")
     model = YOLO(LAST_CKPT)
 else:
-    model = YOLO("yolov8n.pt")   # nano: fast, plenty for a single class
+    model = YOLO(BASE_WEIGHTS)   # nano: fast, plenty for a single class
 
 model.train(
     data      = YAML_PATH,

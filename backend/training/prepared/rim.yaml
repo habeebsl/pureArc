@@ -1,8 +1,0 @@
-# YOLOv8 dataset — basketball rim detector
-path: /workspaces/pureArc/backend/training/prepared
-train: images/train
-val:   images/val
-
-nc: 1
-names:
-  0: hoop

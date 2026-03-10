@@ -21,8 +21,9 @@ import os
 from ultralytics import YOLO
 
 HERE      = os.path.dirname(os.path.abspath(__file__))
-YAML_PATH = os.path.join(HERE, "dataset", "shot_config.yaml")
+YAML_PATH = os.path.join(HERE, "dataset", "shot_config_1300.yaml")
 RUNS_DIR  = os.path.join(HERE, "..", "runs")
+_EXISTING_WEIGHTS = os.path.join(HERE, "..", "runs", "shot_detector", "weights", "best.pt")
 _DEFAULT_BASE = os.path.join(HERE, "..", "weights", "yolov8n.pt")
 
 def main():
@@ -30,8 +31,9 @@ def main():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch",  type=int, default=16)
     parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--base",   type=str, default=_DEFAULT_BASE,
-                        help="Base pretrained weights to fine-tune from")
+    parser.add_argument("--base",   type=str,
+                        default=_EXISTING_WEIGHTS if os.path.exists(_EXISTING_WEIGHTS) else _DEFAULT_BASE,
+                        help="Weights to fine-tune from (defaults to existing best.pt)")
     args = parser.parse_args()
 
     print(f"Config : {YAML_PATH}")

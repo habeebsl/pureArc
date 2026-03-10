@@ -7,13 +7,13 @@ import numpy as np
 from detectors import (
     PoseEstimator, POSE_CONNECTIONS,
     ReleaseDetector,
-    BallDetector,
     RimDetector,
     estimate_distance, draw_distance_overlay,
     ShotDetector,
+    NetMotionDetector,
 )
 
-# Use the custom-trained rim detector if weights exist, else fall back to YOLOWorld+HSV
+# RimDetector is kept as fallback when ShotDetector weights are unavailable
 _CUSTOM_WEIGHTS = os.path.join(os.path.dirname(__file__), "runs", "rim_detector", "weights", "best.pt")
 
 
@@ -41,8 +41,8 @@ def draw_landmarks(frame, landmarks):
 # Initialize pose estimator (downloads model on first run)
 pose_estimator    = PoseEstimator()
 release_detector  = ReleaseDetector()
-ball_detector     = BallDetector()
-rim_detector      = RimDetector(
+# RimDetector used only when ShotDetector is unavailable
+_rim_detector_fallback = RimDetector(
     custom_model_path=_CUSTOM_WEIGHTS if os.path.exists(_CUSTOM_WEIGHTS) else None
 )
 
@@ -53,6 +53,9 @@ try:
 except FileNotFoundError as _e:
     shot_detector = None
     print(f"ShotDetector unavailable: {_e}")
+
+# Net-motion make/miss detector — replaces trajectory-based scoring
+net_motion_detector = NetMotionDetector()
 
 # Score display persistence — keep "SCORE!" on screen for this many frames
 _SCORE_DISPLAY_FRAMES = 45
@@ -69,8 +72,93 @@ _overlay_text   = ""
 _RELEASE_DISPLAY_FRAMES = 30
 _release_display_cnt    = 0
 
+# Last known ball position for release detector continuity
+_last_ball_xy = None
+
+
+# ── Ball position smoother ──────────────────────────────────────────────
+# Smooths raw YOLO ball detections before feeding them to downstream
+# systems (pose selection, release detector).
+#
+# Problems it solves:
+#   • Teleportation — YOLO bbox jumps 300+ px in one frame
+#   • Jitter        — bbox center wobbles ±15 px even when ball is still
+#   • Staleness     — holding a position forever after ball leaves view
+#
+# How it works:
+#   1. Exponential moving average (alpha = 0.4 → responsive but smooth)
+#   2. Outlier rejection: new detection > 120 px from smoothed pos → skip
+#   3. Velocity prediction: coast for up to 8 frames after ball is lost
+#   4. Staleness: expire after 15 frames of no valid detection
+_ball_smooth_xy  = None   # smoothed (x, y) float
+_ball_velocity   = (0.0, 0.0)  # (vx, vy) px/frame
+_ball_miss_count = 0      # consecutive frames w/o valid YOLO detection
+_BALL_SMOOTH_ALPHA   = 0.4   # EMA weight for new detection
+_BALL_MAX_JUMP_PX    = 120   # reject detections farther than this from smoothed
+_BALL_COAST_FRAMES   = 8     # predict from velocity for this many lost frames
+_BALL_EXPIRE_FRAMES  = 15    # kill _last_ball_xy after this many misses
+
+
+def _update_ball_smooth(raw_xy):
+    """
+    Call every frame with raw_xy = (x, y) from YOLO or None.
+    Updates _ball_smooth_xy, _ball_velocity, _last_ball_xy.
+    """
+    global _ball_smooth_xy, _ball_velocity, _ball_miss_count, _last_ball_xy
+
+    if raw_xy is not None:
+        rx, ry = float(raw_xy[0]), float(raw_xy[1])
+
+        if _ball_smooth_xy is None:
+            # First detection — initialise
+            _ball_smooth_xy = (rx, ry)
+            _ball_velocity  = (0.0, 0.0)
+            _ball_miss_count = 0
+        else:
+            dx = rx - _ball_smooth_xy[0]
+            dy = ry - _ball_smooth_xy[1]
+            dist = math.hypot(dx, dy)
+
+            if dist <= _BALL_MAX_JUMP_PX:
+                # Good detection — blend into EMA
+                a = _BALL_SMOOTH_ALPHA
+                sx = _ball_smooth_xy[0] * (1 - a) + rx * a
+                sy = _ball_smooth_xy[1] * (1 - a) + ry * a
+                _ball_velocity  = (sx - _ball_smooth_xy[0], sy - _ball_smooth_xy[1])
+                _ball_smooth_xy = (sx, sy)
+                _ball_miss_count = 0
+            else:
+                # Outlier — possibly teleportation.  If we've been missing
+                # for several frames, accept it as the ball reappearing.
+                if _ball_miss_count >= _BALL_COAST_FRAMES:
+                    _ball_smooth_xy = (rx, ry)
+                    _ball_velocity  = (0.0, 0.0)
+                    _ball_miss_count = 0
+                else:
+                    # Reject this frame, treat as miss
+                    _ball_miss_count += 1
+    else:
+        _ball_miss_count += 1
+
+    # Coast: predict from velocity while ball is temporarily lost
+    if _ball_miss_count > 0 and _ball_smooth_xy is not None:
+        if _ball_miss_count <= _BALL_COAST_FRAMES:
+            vx, vy = _ball_velocity
+            _ball_smooth_xy = (
+                _ball_smooth_xy[0] + vx,
+                _ball_smooth_xy[1] + vy,
+            )
+
+    # Expire
+    if _ball_miss_count > _BALL_EXPIRE_FRAMES:
+        _ball_smooth_xy = None
+        _ball_velocity  = (0.0, 0.0)
+        _last_ball_xy   = None
+    elif _ball_smooth_xy is not None:
+        _last_ball_xy = (int(_ball_smooth_xy[0]), int(_ball_smooth_xy[1]))
+
 # Load video (replace with your file)
-cap = cv2.VideoCapture("test_shot4.mp4")
+cap = cv2.VideoCapture("test_shot8.mp4")
 
 # Set up video writer — write raw mp4v to a temp file, re-encode to H.264 at the end
 _OUTPUT_FILE = "output.mp4"
@@ -95,7 +183,40 @@ while cap.isOpened():
     # Convert BGR → RGB
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    landmarks = pose_estimator.process_frame(frame_rgb)
+    # --- Run YOLO FIRST so we have fresh ball position for pose selection ---
+    shot_result = shot_detector.update(_shot_frame) if shot_detector is not None else None
+
+    # Derive ball position from the shot detector (raw, current-frame).
+    _raw_ball_xy = None
+    if shot_result is not None and shot_result["ball_bbox"]:
+        sx1, sy1, sx2, sy2 = shot_result["ball_bbox"]
+        bx = int((sx1 + sx2) / 2 * _shot_sx)
+        by = int((sy1 + sy2) / 2 * _shot_sy)
+        br = int(max(sx2 - sx1, sy2 - sy1) / 2 * max(_shot_sx, _shot_sy))
+        ball_result = (bx, by, br)
+        _raw_ball_xy = (bx, by)
+    else:
+        ball_result = None
+
+    # Update smoother — _last_ball_xy will be the smoothed position
+    if ball_result:
+        _update_ball_smooth(_raw_ball_xy)
+    else:
+        _update_ball_smooth(None)
+
+    # For pose selection: prefer raw current-frame ball pos (most accurate
+    # for "who is holding the ball"), fall back to smoothed for continuity.
+    _pose_ball_xy = _raw_ball_xy if _raw_ball_xy is not None else _last_ball_xy
+
+    # Pass ball position so PoseEstimator picks the ball-handler
+    # when multiple people are in frame.
+    landmarks = pose_estimator.process_frame(frame_rgb, ball_xy=_pose_ball_xy)
+
+    # When the pose tracker switches to a different person, flush the
+    # release detector buffers — stale data from another player's pose
+    # causes false positives.
+    if pose_estimator.person_switched:
+        release_detector.reset()
 
     if landmarks:
         angles = pose_estimator.get_joint_angles(landmarks)
@@ -110,10 +231,19 @@ while cap.isOpened():
         # Draw skeleton
         draw_landmarks(frame, landmarks)
 
-    # --- Rim detection (stationary; locks after a few consistent frames) ---
-    rim_result = rim_detector.detect_rim(frame)
-
-    ball_result = ball_detector.detect_ball(frame)
+    # Derive hoop position from the shot detector; fall back to RimDetector when unavailable.
+    if shot_result is not None and shot_result["hoop_bbox"]:
+        hx1, hy1, hx2, hy2 = shot_result["hoop_bbox"]
+        # Scale from native resolution to 640×480 and build rim_result dict
+        hx1s, hy1s = int(hx1 * _shot_sx), int(hy1 * _shot_sy)
+        hx2s, hy2s = int(hx2 * _shot_sx), int(hy2 * _shot_sy)
+        rim_result = {
+            "center": ((hx1s + hx2s) // 2, (hy1s + hy2s) // 2),
+            "bbox":   (hx1s, hy1s, hx2s, hy2s),
+            "locked": True,
+        }
+    else:
+        rim_result = _rim_detector_fallback.detect_rim(frame)
 
     # Always draw ball detection result so we can visually verify it independently
     if ball_result:
@@ -140,7 +270,7 @@ while cap.isOpened():
     elif rim_result:
         draw_distance_overlay(frame, None, rim_result)
 
-    if ball_result and landmarks:
+    if landmarks:
         h, w = frame.shape[:2]
 
         # Right-side landmarks (shooting hand)
@@ -158,7 +288,11 @@ while cap.isOpened():
         sr_x    = int(shoulder_r.x * w)
         sr_y    = int(shoulder_r.y * h)
 
-        bx, by, br = ball_result
+        # Ball position: use last known, or wrist coords to zero-out ball signals
+        if _last_ball_xy:
+            bx, by = _last_ball_xy
+        else:
+            bx, by = wrist_x, wrist_y
         elbow_angle = angles['elbow_angle']
 
         # Draw wrist
@@ -189,45 +323,52 @@ while cap.isOpened():
         cv2.putText(frame, "RELEASE", (50, 70),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 0, 255), 3)
 
-    # --- Trajectory-based scoring (shot detector) ---
-    shot_result = shot_detector.update(_shot_frame) if shot_detector is not None else None
+    # ── Net-motion make/miss detection ─────────────────────────────────
+    # Feed the net motion detector: it needs the frame, hoop bbox, and
+    # whether the ShotDetector is currently ARMED (ball near rim).
+    _hoop_bbox_for_net = None
+    if rim_result and "bbox" in rim_result:
+        _hoop_bbox_for_net = rim_result["bbox"]
+    _armed = shot_result is not None and shot_result["state"] == "ARMED"
+    net_result = net_motion_detector.update(frame, _hoop_bbox_for_net, _armed)
 
-    # Draw shot-detector detections for visual debug (scale from native → 640×480)
+    # HUD overlays
     if shot_result is not None:
-        if shot_result["ball_bbox"]:
-            sx1, sy1, sx2, sy2 = shot_result["ball_bbox"]
-            sx1,sy1,sx2,sy2 = int(sx1*_shot_sx),int(sy1*_shot_sy),int(sx2*_shot_sx),int(sy2*_shot_sy)
-            cv2.rectangle(frame, (sx1, sy1), (sx2, sy2), (255, 128, 0), 1)
-        if shot_result["hoop_bbox"]:
-            hx1, hy1, hx2, hy2 = shot_result["hoop_bbox"]
-            hx1,hy1,hx2,hy2 = int(hx1*_shot_sx),int(hy1*_shot_sy),int(hx2*_shot_sx),int(hy2*_shot_sy)
-            cv2.rectangle(frame, (hx1, hy1), (hx2, hy2), (0, 128, 255), 1)
         traj_state = shot_result["state"]
         traj_clr   = (0, 255, 100) if traj_state != "WATCHING" else (200, 200, 0)
-        cv2.putText(frame, f"TRAJ:{traj_state}",
+        cv2.putText(frame, f"YOLO:{traj_state}",
                     (frame.shape[1] - 160, 55),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, traj_clr, 1)
-        # Makes / attempts counter top-right
-        makes    = shot_result["makes"]
-        attempts = shot_result["attempts"]
-        cv2.putText(frame, f"{makes} / {attempts}",
-                    (frame.shape[1] - 110, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-    # Handle a confirmed make or miss
-    if shot_result is not None and shot_result["attempt"]:
-        if shot_result["make"]:
+    # Net motion state + score
+    _net_state = net_result["state"]
+    _net_score = net_result["net_score"]
+    _net_clr = (0, 200, 255) if _net_state == "WATCHING" else (200, 200, 0)
+    cv2.putText(frame, f"NET:{_net_state} {_net_score:.1f}",
+                (frame.shape[1] - 220, 75),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, _net_clr, 1)
+
+    # Makes / attempts counter top-right (from net motion detector)
+    makes    = net_result["makes"]
+    attempts = net_result["attempts"]
+    cv2.putText(frame, f"{makes} / {attempts}",
+                (frame.shape[1] - 110, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+    # Handle a confirmed make or miss from NET MOTION
+    if net_result["attempt"]:
+        if net_result["make"]:
             _score_total      += 1
             _overlay_color     = (0, 255, 0)    # green flash
             _overlay_text      = "Make"
             _fade_counter      = _FADE_FRAMES
             _score_display_cnt = _SCORE_DISPLAY_FRAMES
-            print(f"SCORE #{_score_total}  [TRAJ]")
+            print(f"SCORE #{_score_total}  [NET]")
         else:
             _overlay_color = (0, 0, 255)        # red flash
             _overlay_text  = "Miss"
             _fade_counter  = _FADE_FRAMES
-            print(f"MISS  (attempts={shot_result['attempts']})")
+            print(f"MISS  (attempts={net_result['attempts']})  [NET]")
 
     # Make / Miss colored screen flash
     if _fade_counter > 0:

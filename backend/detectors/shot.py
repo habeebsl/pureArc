@@ -30,10 +30,10 @@ _CLS_BALL = 0
 _CLS_HOOP = 1
 
 # Horizontal reach beyond the hoop bbox edges that still counts as "in bounds"
-_HOOP_H_MARGIN = 0.35   # fraction of hoop width
+_HOOP_H_MARGIN = 0.50   # fraction of hoop width
 
 # How many frames to stay ARMED before giving up and counting a miss
-_ARMED_TIMEOUT = 60
+_ARMED_TIMEOUT = 75
 
 # Ball must have moved at least this many pixels across recent detections to
 # be considered "in play" — prevents stationary false-positives (e.g. the
@@ -80,6 +80,8 @@ class ShotDetector:
         self._armed_frames  = 0            # frames spent in ARMED
         self._armed_hoop    = None         # hoop snapshot taken when ARMED
         self._armed_case    = None         # 'A' (ball above rim) | 'B' (ball in bbox from below)
+        self._armed_start_frame = 0        # frame_count when ARMED was entered
+        self._armed_in_bbox_count = 0      # how many ball detections inside hoop bbox while ARMED
         self._last_ball_frame   = 0        # frame_count when ball was last detected while ARMED
         self._last_ball_in_bbox = False    # was ball inside hoop bbox on last detection while ARMED
 
@@ -136,7 +138,7 @@ class ShotDetector:
                 result["hoop_bbox"] = (x1, y1, x2, y2)
 
         # ── Clean positions ────────────────────────────────────────────── #
-        self.ball_pos = clean_ball_pos(self.ball_pos, self.frame_count)
+        self.ball_pos = clean_ball_pos(self.ball_pos, self.frame_count, self.hoop_pos)
         if len(self.hoop_pos) > 1:
             self.hoop_pos = clean_hoop_pos(self.hoop_pos)
 
@@ -152,16 +154,22 @@ class ShotDetector:
                     self._armed_case        = 'A'
                     self._armed_frames      = 0
                     self._armed_hoop        = list(self.hoop_pos)
+                    self._armed_start_frame = self.frame_count
+                    self._armed_in_bbox_count = 0
                     self._last_ball_frame   = self.frame_count
                     self._last_ball_in_bbox = False
+                    print(f"[SHOT] → ARMED (case A) frame={self.frame_count}")
                 elif self._ball_inside_hoop_lower_moving():
                     # Case B: ball rising from below through the hoop
                     self._state             = "ARMED"
                     self._armed_case        = 'B'
                     self._armed_frames      = 0
                     self._armed_hoop        = list(self.hoop_pos)
+                    self._armed_start_frame = self.frame_count
+                    self._armed_in_bbox_count = 1  # already inside bbox when arming
                     self._last_ball_frame   = self.frame_count
                     self._last_ball_in_bbox = True   # already inside bbox when arming
+                    print(f"[SHOT] → ARMED (case B) frame={self.frame_count}")
 
         elif self._state == "ARMED":
             self._armed_frames += 1
@@ -170,12 +178,15 @@ class ShotDetector:
             if self.ball_pos:
                 bx, by = self.ball_pos[-1][0]
                 self._last_ball_frame   = self.frame_count
-                self._last_ball_in_bbox = self._is_inside_hoop_bbox(bx, by)
+                in_bbox = self._is_inside_hoop_bbox(bx, by)
+                self._last_ball_in_bbox = in_bbox
+                if in_bbox:
+                    self._armed_in_bbox_count += 1
 
             frames_since_ball = self.frame_count - self._last_ball_frame
 
             # Make check 1: ball crossed the rim plane downward (arcing shot)
-            if self.hoop_pos and self.ball_pos and self._ball_crossed_rim():
+            if self.hoop_pos and self.ball_pos and self._armed_frames >= 2 and self._ball_crossed_rim():
                 self.makes    += 1
                 self.attempts += 1
                 result["scored"]   = True
@@ -187,10 +198,13 @@ class ShotDetector:
                 self._cooldown     = self._cooldown_max
                 self._armed_hoop   = None
                 self._armed_case   = None
+                print(f"[SHOT] MAKE (crossing) frame={self.frame_count}  makes={self.makes}")
 
             # Make check 2: ball vanished inside hoop bbox (dunk — ball lost in net)
             # Applies regardless of how ARMED was triggered.
-            elif self._last_ball_in_bbox and frames_since_ball >= _BBOX_VANISH_FRAMES:
+            elif (self._last_ball_in_bbox
+                  and self._armed_in_bbox_count >= 1
+                  and frames_since_ball >= _BBOX_VANISH_FRAMES):
                 self.makes    += 1
                 self.attempts += 1
                 result["scored"]   = True
@@ -202,6 +216,7 @@ class ShotDetector:
                 self._cooldown     = self._cooldown_max
                 self._armed_hoop   = None
                 self._armed_case   = None
+                print(f"[SHOT] MAKE (vanish) frame={self.frame_count}  makes={self.makes}")
 
             elif self._armed_frames > _ARMED_TIMEOUT:
                 # Ball never scored — count as miss and reset
@@ -212,6 +227,7 @@ class ShotDetector:
                 self._state      = "WATCHING"
                 self._armed_hoop = None
                 self._armed_case = None
+                print(f"[SHOT] MISS (timeout) frame={self.frame_count}  attempts={self.attempts}")
 
         result["state"] = self._state
         self.frame_count += 1
@@ -245,19 +261,13 @@ class ShotDetector:
     def _ball_above_rim(self) -> bool:
         """
         Case A trigger: ball is above the rim plane within horizontal hoop
-        bounds AND has demonstrably risen from below the rim.
-
-        The "rose from below" check prevents false arms on objects that are
-        always above the rim (subtitle text, backboard target squares, etc.)
-        being misdetected as basketballs.  A real shot ball will always have
-        at least one recent detection at the same approximate x that was
-        below (or at) the rim level before it crossed upward.
+        bounds AND is moving.  The movement check prevents false arms on
+        stationary objects always above the rim (subtitle text, backboard
+        target squares, etc.) being misdetected as basketballs.
         """
         rim_top, x1, x2 = self._rim_bounds()
         bx, by = self.ball_pos[-1][0]
-        if not (by < rim_top and x1 <= bx <= x2 and self._ball_moving()):
-            return False
-        return self._ball_rose_from_below(rim_top, bx)
+        return by < rim_top and x1 <= bx <= x2 and self._ball_moving()
 
     def _ball_rose_from_below(self, rim_top: float, curr_bx: int) -> bool:
         """
@@ -319,13 +329,16 @@ class ShotDetector:
         Scan recent ball positions for a downward crossing of the rim plane
         while inside horizontal hoop bounds.
 
-        Uses the current hoop position (tracks camera movement during the
-        shot) with the armed snapshot as fallback if hoop leaves frame.
+        Only considers entries from AFTER the ARMED state was entered —
+        stale crossings from previous shots must not trigger a make.
         """
         hp = self.hoop_pos if self.hoop_pos else self._armed_hoop
         rim_top, x1, x2 = self._rim_bounds(hp)
 
         for i in range(len(self.ball_pos) - 1):
+            # Skip entries from before this ARMED cycle
+            if self.ball_pos[i][1] < self._armed_start_frame:
+                continue
             y_prev = self.ball_pos[i][0][1]
             y_curr = self.ball_pos[i + 1][0][1]
             cx     = self.ball_pos[i + 1][0][0]

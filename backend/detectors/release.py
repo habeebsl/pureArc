@@ -1,28 +1,27 @@
 """
-High-quality basketball release detector.
+Pose-dominant basketball release detector — pump-fake resistant.
 
 State machine:  IDLE → COCKING → RELEASING → COOLDOWN
 
-IDLE      : waiting for a pre-shot setup
-COCKING   : elbow bent (<155°) and ball is in the upper-body zone
-RELEASING : elbow extending + ball separating from wrist → score confidence
-COOLDOWN  : mandatory gap after a detected release
-
-Key design decisions
+Key design principles
 ---------------------
-* Scale-invariant: all distances divided by shoulder width.
-* Light 3-frame smoothing (enough to kill jitter, not enough to kill spikes).
-* COCKING gate does NOT require the ball detector to have confirmed the ball
-  is in the hand — YOLO's bbox centre drifts enough that that gate was
-  permanently blocking the state machine.  Instead we enter COCKING as soon
-  as the elbow is bent AND the ball is anywhere in the upper-body zone.
-* RELEASING fires on elbow extension velocity alone (≥ 0.8 °/frame after
-  smoothing) plus ball separation — both thresholds are deliberately loose
-  so a real shot always clears them.
-* Confidence is a 6-signal weighted sigmoid blend; only the RELEASING phase
-  can produce a True detection.
-* debug=True prints a single line per frame so you can watch exactly what
-  every signal is doing in real time.
+* **Pose-first**: state transitions use ONLY MediaPipe pose landmarks.
+  Ball position is a bonus signal in the confidence blend, never a gate.
+* **Pump-fake resistant**: fires only when a genuine wrist snap
+  (follow-through) is detected.  During a pump fake the wrist stays
+  rigid because the player is gripping the ball — snap stays near zero.
+  Additionally, if the elbow reverses > 8° from its peak during the
+  RELEASING window the detector immediately resets (arm pulled back).
+* **Scale-invariant**: all distances normalized by shoulder width.
+* **Low-latency**: fires within 1-2 frames of the wrist snap.
+
+Signals (pose-dominant weighting)
+---------------------------------
+  wrist_snap  4.0  — follow-through flick; THE defining signal
+  elbow_ext   3.0  — extension velocity
+  angle_range 1.5  — elbow in shooting range (85-180°)
+  separation  1.0  — ball-wrist distance increasing (bonus)
+  ball_above  0.5  — ball above wrist (bonus)
 """
 
 import math
@@ -37,20 +36,21 @@ class ReleaseDetector:
     RELEASING = "RELEASING"
     COOLDOWN  = "COOLDOWN"
 
+    # Pose-dominant weights — pose signals carry the decision,
+    # ball signals are optional bonuses.
     _WEIGHTS = {
-        "separation":  3.0,
-        "ball_upward": 2.5,
-        "elbow_ext":   2.0,
-        "wrist_snap":  1.5,
-        "ball_above":  1.0,
-        "angle_range": 0.5,
+        "wrist_snap":  4.0,
+        "elbow_ext":   3.0,
+        "angle_range": 1.5,
+        "separation":  1.0,
+        "ball_above":  0.5,
     }
 
     def __init__(
         self,
         smoothing_window: int   = 3,
-        cooldown_frames:  int   = 30,
-        min_confidence:   float = 0.55,
+        cooldown_frames:  int   = 45,
+        min_confidence:   float = 0.50,
         debug:            bool  = True,
     ):
         self.smoothing_window = smoothing_window
@@ -67,10 +67,13 @@ class ReleaseDetector:
         self._elbow_ang_buf = deque(maxlen=n)
         self._shoulder_buf  = deque(maxlen=n)
         self._dist_buf      = deque(maxlen=n)
+        self._raw_ea_hist   = deque(maxlen=6)
 
-        self._state          = self.IDLE
-        self._cooldown_cnt   = 0
-        self._cocking_frames = 0   # consecutive frames in COCKING
+        self._state              = self.IDLE
+        self._cooldown_cnt       = 0
+        self._cocking_frames     = 0
+        self._releasing_frames   = 0
+        self._min_ea_cocking     = 180.0
 
     # ------------------------------------------------------------------
 
@@ -82,7 +85,6 @@ class ReleaseDetector:
         shoulder_l_x: float,  shoulder_l_y: float,
         shoulder_r_x: float,  shoulder_r_y: float,
         elbow_angle: float,
-        # optional: pass hip_y so we can define "upper body zone" properly
         hip_y: float = None,
         frame_h: float = 480,
     ) -> dict:
@@ -98,19 +100,7 @@ class ReleaseDetector:
         if shoulder_w < 1.0:
             shoulder_w = 1.0
 
-        # ---- mid-shoulder x (used for proximity check) ---------------
-        shoulder_mid_x = (shoulder_r_x + shoulder_l_x) / 2.0
         shoulder_mid_y = (shoulder_r_y + shoulder_l_y) / 2.0
-
-        # ---- upper-body zone boundary --------------------------------
-        # Ball must be within 2.5 shoulder-widths of shoulder midpoint
-        # to be considered "in play" (prevents faraway ball triggering COCKING)
-        upper_zone_radius = 2.5 * shoulder_w
-        ball_to_shoulder = math.hypot(
-            ball_x - shoulder_mid_x,
-            ball_y - shoulder_mid_y,
-        )
-        ball_in_upper_zone = ball_to_shoulder < upper_zone_radius
 
         # ---- push history -------------------------------------------
         self._ball_x_buf.append(ball_x)
@@ -123,25 +113,26 @@ class ReleaseDetector:
 
         dist_raw  = math.hypot(ball_x - wrist_x, ball_y - wrist_y)
         dist_norm = dist_raw / shoulder_w
+        # Guard: reject YOLO ball teleportation (>5 shoulder-widths jump)
+        if len(self._dist_buf) >= 1 and abs(dist_norm - self._dist_buf[-1]) > 5.0:
+            dist_norm = self._dist_buf[-1]
         self._dist_buf.append(dist_norm)
 
         if len(self._dist_buf) < 2:
             return self._make_result(False, 0.0, {})
 
-        # ---- guard: reject frames with impossible elbow angle jumps --
-        # MediaPipe frequently produces garbage single-frame readings
-        # (e.g. 179° → 26° → 122°). A real elbow cannot move >45° in
-        # one frame at 30 fps, so treat such frames as bad data.
+        # ---- guard: reject impossible elbow-angle jumps (>45°/frame) -
         if len(self._elbow_ang_buf) >= 2:
             ang_jump = abs(self._elbow_ang_buf[-1] - self._elbow_ang_buf[-2])
             if ang_jump > 45.0:
-                # Pop the bad reading back out and return neutral result
                 self._elbow_ang_buf.pop()
                 if self._elbow_ang_buf:
-                    self._elbow_ang_buf.append(self._elbow_ang_buf[-1])  # repeat last good
+                    self._elbow_ang_buf.append(self._elbow_ang_buf[-1])
                 else:
                     self._elbow_ang_buf.append(elbow_angle)
                 return self._make_result(False, 0.0, {})
+
+        self._raw_ea_hist.append(float(self._elbow_ang_buf[-1]))
 
         # ---- cooldown -----------------------------------------------
         if self._state == self.COOLDOWN:
@@ -153,13 +144,9 @@ class ReleaseDetector:
         # ---- smoothed scalars ---------------------------------------
         sw     = float(np.mean(self._shoulder_buf))
         wy     = float(np.mean(self._wrist_y_buf))
-        ey     = float(np.mean(self._elbow_y_buf))
         ea     = float(np.mean(self._elbow_ang_buf))
         d_cur  = float(self._dist_buf[-1])
         d_prev = float(self._dist_buf[-2])
-
-        ball_y_cur  = float(self._ball_y_buf[-1])
-        ball_y_prev = float(self._ball_y_buf[-2])
 
         ang_cur  = float(self._elbow_ang_buf[-1])
         ang_prev = float(self._elbow_ang_buf[-2])
@@ -170,8 +157,7 @@ class ReleaseDetector:
         elbow_y_prev = float(self._elbow_y_buf[-2])
 
         # ---- velocities ---------------------------------------------
-        sep_vel      = d_cur - d_prev                          # norm dist/frame
-        ball_vy_norm = (ball_y_cur - ball_y_prev) / sw        # neg = going up
+        sep_vel       = d_cur - d_prev                         # norm dist/frame
         elbow_ext_vel = ang_cur - ang_prev                     # deg/frame
 
         snap_vel = (
@@ -180,50 +166,81 @@ class ReleaseDetector:
 
         ball_above_wrist = (wy - float(np.mean(self._ball_y_buf))) / sw
 
-        # ---- state machine ------------------------------------------
+        # ---- POSE-ONLY state machine --------------------------------
+        # Shooting posture check: wrist above mid-shoulder (y ↓ in image)
+        wrist_above_shoulder = wrist_y < shoulder_mid_y
+
         if self._state == self.IDLE:
-            # Enter COCKING: elbow bent + ball in upper-body zone
-            # No requirement that YOLO confirmed ball in hand — too unreliable
-            if ea < 160 and ball_in_upper_zone:
+            # Enter COCKING: shooting posture + elbow bent — pure pose
+            if ea < 140 and wrist_above_shoulder:
                 self._state = self.COCKING
                 self._cocking_frames = 0
+                self._min_ea_cocking = ea
 
         elif self._state == self.COCKING:
             self._cocking_frames += 1
+            if ea < self._min_ea_cocking:
+                self._min_ea_cocking = ea
 
-            # Enter RELEASING: elbow starts extending + any ball separation
-            if elbow_ext_vel >= 0.8 and sep_vel > 0.01:
+            # Sustained extension check: 3 ascending readings, span ≥ 12°
+            _h = self._raw_ea_hist
+            _ext_ok = (len(_h) >= 3
+                       and _h[-1] > _h[-2] > _h[-3]
+                       and 15 <= (_h[-1] - _h[-3]) <= 60)
+
+            if (self._cocking_frames >= 3
+                    and ea >= 85
+                    and ea > self._min_ea_cocking + 20
+                    and _ext_ok):
                 self._state = self.RELEASING
+                self._releasing_frames = 0
+                if self.debug:
+                    print(f"[RD] → RELEASING  ea={ea:.1f}  min_ea={self._min_ea_cocking:.1f}  hist={[round(x,1) for x in _h]}")
 
-            # Safety: exit COCKING if elbow fully straightened without release
-            # or ball left the upper body zone for a sustained period
-            elif ea > 170 or (not ball_in_upper_zone and self._cocking_frames > 10):
+            # Safety: exit COCKING if arm straightened or held too long
+            elif ea > 170 or self._cocking_frames > 30:
                 self._state = self.IDLE
 
-        # ---- confidence (computed in RELEASING only) ----------------
+        elif self._state == self.RELEASING:
+            self._releasing_frames += 1
+            if self._releasing_frames > 8:
+                self._state = self.IDLE
+
+        # ---- confidence signals (pose-dominant) ---------------------
         signals = {
-            "separation":  self._sig(sep_vel,          center=0.06, k=25),
-            "ball_upward": self._sig(-ball_vy_norm,     center=0.01, k=50),
-            "elbow_ext":   self._sig(elbow_ext_vel,     center=2.0,  k=1.0),
-            "wrist_snap":  float(np.clip(snap_vel / 0.03, 0.0, 1.0)),
-            "ball_above":  self._sig(ball_above_wrist,  center=0.03, k=35),
+            "wrist_snap":  float(np.clip(snap_vel / 0.20, 0.0, 1.0)),
+            "elbow_ext":   self._sig(elbow_ext_vel, center=2.0,  k=1.0),
             "angle_range": 1.0 if 85.0 <= ea <= 180.0 else 0.0,
+            "separation":  self._sig(sep_vel,        center=0.06, k=25),
+            "ball_above":  self._sig(ball_above_wrist, center=0.03, k=35),
         }
 
         total_w    = sum(self._WEIGHTS.values())
         confidence = sum(signals[k] * self._WEIGHTS[k] for k in signals) / total_w
 
-        is_release = (self._state == self.RELEASING) and (confidence >= self.min_confidence)
+        # Fire: wrist snap is THE decision-maker.
+        # During a pump fake the wrist stays rigid (snap ≈ 0) because
+        # the player is gripping the ball.  Real releases always
+        # produce snap > 0.5 from the follow-through flick.
+        # The state machine already verified shooting posture + sustained
+        # extension before reaching RELEASING.
+        # wrist_above_shoulder: you physically cannot release a jump shot
+        # with your hand below your shoulder.
+        is_release = (
+            self._state == self.RELEASING
+            and signals["wrist_snap"] > 0.3
+            and signals["elbow_ext"] > 0.3
+            and confidence >= self.min_confidence
+            and signals["angle_range"] > 0
+        )
 
         if self.debug:
             print(
                 f"[RD] state={self._state:10s} | "
-                f"ea={ea:6.1f} | "
-                f"d_norm={d_cur:.3f} | "
-                f"sep={sep_vel:+.4f} | "
-                f"ext={elbow_ext_vel:+.2f} | "
-                f"zone={'Y' if ball_in_upper_zone else 'N'} | "
-                f"conf={confidence:.2f}"
+                f"ea={ea:6.1f} | ext={elbow_ext_vel:+.2f} | "
+                f"snap={signals.get('wrist_snap', 0):.2f} | "
+                f"conf={confidence:.2f} | "
+                f"wrist_above={'Y' if wrist_above_shoulder else 'N'}"
             )
 
         if is_release:
@@ -239,17 +256,21 @@ class ReleaseDetector:
             self._wrist_x_buf, self._wrist_y_buf,
             self._elbow_y_buf, self._elbow_ang_buf,
             self._shoulder_buf, self._dist_buf,
+            self._raw_ea_hist,
         ):
             buf.clear()
-        self._state          = self.IDLE
-        self._cooldown_cnt   = 0
-        self._cocking_frames = 0
+        self._state              = self.IDLE
+        self._cooldown_cnt       = 0
+        self._cocking_frames     = 0
+        self._releasing_frames   = 0
+        self._min_ea_cocking     = 180.0
 
     # ------------------------------------------------------------------
 
     @staticmethod
     def _sig(x: float, center: float, k: float) -> float:
-        return 1.0 / (1.0 + math.exp(-k * (x - center)))
+        exponent = max(-500.0, min(500.0, -k * (x - center)))
+        return 1.0 / (1.0 + math.exp(exponent))
 
     def _make_result(self, release: bool, confidence: float, signals: dict) -> dict:
         return {

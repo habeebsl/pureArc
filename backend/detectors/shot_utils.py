@@ -77,10 +77,12 @@ def in_hoop_region(center, hoop_pos):
     return x1 < cx < x2 and y1 < cy < y2
 
 
-def clean_ball_pos(ball_pos, frame_count):
+def clean_ball_pos(ball_pos, frame_count, hoop_pos=None):
     """
     Remove erratic or stale ball positions:
     - Jump > 4× diameter within 5 frames → spurious detection
+      (exempted when the new detection is near the hoop — the ball
+       legitimately jumps from shooter to rim area during a shot arc)
     - Non-square bbox (aspect ratio > 1.4) → probably not the ball
     - Positions older than 30 frames
     """
@@ -91,7 +93,11 @@ def clean_ball_pos(ball_pos, frame_count):
         dist = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
         max_dist = 4 * math.sqrt(w1 ** 2 + h1 ** 2)
 
-        if dist > max_dist and f_dif < 5:
+        # Don't reject near-hoop detections — during a shot the ball
+        # jumps from the shooter area to the rim area in a few frames.
+        near_hoop = hoop_pos and in_hoop_region((x2, y2), hoop_pos)
+
+        if dist > max_dist and f_dif < 5 and not near_hoop:
             ball_pos.pop()
         elif (w2 * 1.4 < h2) or (h2 * 1.4 < w2):
             ball_pos.pop()

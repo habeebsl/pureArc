@@ -1,6 +1,5 @@
 """
-RTMPose estimator — drop-in replacement for the MediaPipe-based
-PoseEstimator in pose.py.
+RTMPose estimator — multi-player aware.
 
 Uses rtmlib (lightweight ONNX-based RTMPose inference).  Landmarks are
 returned as a 33-element list whose indices match MediaPipe's numbering
@@ -8,9 +7,18 @@ so that main.py, distance.py, and release.py need zero changes.
 
 COCO keypoints (17) are mapped into the MediaPipe slots; unmapped slots
 (hands, face detail, heels, foot-index) are filled with visibility = 0.
+
+process_frame() returns a PoseResult containing:
+  • all_poses   — every detected person (normalised 0-1)
+  • primary     — the tracked/selected player's landmarks (or None)
+  • primary_idx — index into all_poses (or -1)
+
+To switch the tracked player call select_primary(pixel_xy) with the
+tap location — the person whose torso is closest will become primary.
 """
 
 import math
+from dataclasses import dataclass, field
 
 import numpy as np
 from rtmlib import Body
@@ -93,6 +101,14 @@ class PoseLandmark:
     RIGHT_ANKLE    = 28
 
 
+@dataclass
+class PoseResult:
+    """Result of a single frame's pose estimation."""
+    all_poses:   list        # list of landmark lists (one per person, normalised 0-1)
+    primary:     object      # landmarks for the tracked player, or None
+    primary_idx: int = -1    # index into all_poses (-1 = none)
+
+
 # ── Main estimator ────────────────────────────────────────────────────
 class PoseEstimator:
     _LOCK_RADIUS_PX   = 50
@@ -115,17 +131,21 @@ class PoseEstimator:
         self._pending_torso = None
         self._pending_count = 0
         self.person_switched = False
-        self._smooth_buf    = None  # list of (x, y, vis) per 33 slots
+        # Per-person smooth buffers keyed by person index
+        self._smooth_bufs: dict[int, list] = {}
+        self._primary_smooth_key: int | None = None
+        # Manual selection: set via select_primary()
+        self._manual_lock_xy: tuple | None = None
 
     # ------------------------------------------------------------------ #
-    # Public API (matches MediaPipe PoseEstimator)
+    # Public API
     # ------------------------------------------------------------------ #
 
-    def process_frame(self, frame_rgb, ball_xy=None):
+    def process_frame(self, frame_rgb, ball_xy=None) -> PoseResult:
         """
         Run RTMPose on *frame_rgb* (RGB uint8 H×W×3).
 
-        Returns a list of 33 NormalizedLandmark-like objects, or None.
+        Returns PoseResult with all detected poses and the primary player.
         """
         self.person_switched = False
         h, w = frame_rgb.shape[:2]
@@ -138,75 +158,47 @@ class PoseEstimator:
             self._lock_miss += 1
             if self._lock_miss > self._LOCK_EXPIRE:
                 self._reset_lock()
-            return None
+            return PoseResult(all_poses=[], primary=None, primary_idx=-1)
 
         n_people = keypoints.shape[0]
 
-        # Build per-person landmark lists (pixel coords initially)
-        poses = []
+        # Build per-person landmark lists (pixel coords)
+        raw_poses = []
         for i in range(n_people):
             lms = _coco_to_landmarks(keypoints[i], scores[i])
-            poses.append(lms)
+            raw_poses.append(lms)
 
-        # ── Person selection logic (same as MediaPipe version) ──
+        # ── Select primary player ─────────────────────────────────── #
+        primary_raw, primary_raw_idx = self._select_primary(raw_poses, ball_xy, h, w)
 
-        if n_people == 1:
-            chosen = poses[0]
-            tc = self._torso_center(chosen, h, w)
+        # ── Finalise all poses (normalise to 0-1) ────────────────── #
+        all_normalised = []
+        for i, pose in enumerate(raw_poses):
+            is_primary = (i == primary_raw_idx)
+            norm = self._finalize(pose, h, w, person_key=i, smooth=is_primary)
+            all_normalised.append(norm)
 
-            if self._locked_torso is None:
-                if self._pending_torso is not None:
-                    d = math.hypot(tc[0] - self._pending_torso[0],
-                                   tc[1] - self._pending_torso[1])
-                    if d < self._LOCK_RADIUS_PX:
-                        self._pending_count += 1
-                        self._pending_torso = tc
-                        if self._pending_count >= self._LOCK_INIT_FRAMES:
-                            self._commit_lock(tc)
-                    else:
-                        self._pending_torso = tc
-                        self._pending_count = 0
-                else:
-                    self._pending_torso = tc
-                    self._pending_count = 0
-                return self._finalize(chosen, h, w)
+        primary_norm = all_normalised[primary_raw_idx] if primary_raw_idx >= 0 else None
 
-            if self._lock_dist(tc) > self._LOCK_RADIUS_PX:
-                self._lock_miss += 1
-                if self._lock_miss > self._LOCK_EXPIRE:
-                    self._reset_lock()
-                    self._pending_torso = tc
-                    self._pending_count = 0
-                    self.person_switched = True
-                    return self._finalize(chosen, h, w)
-                return None
+        return PoseResult(
+            all_poses=all_normalised,
+            primary=primary_norm,
+            primary_idx=primary_raw_idx,
+        )
 
-            self._commit_lock(tc)
-            return self._finalize(chosen, h, w)
-
-        # ── Multiple people ──
-
-        if self._locked_torso is not None:
-            closest, dist = self._nearest_to_lock(poses, h, w)
-            if dist < self._LOCK_RADIUS_PX:
-                self._commit_lock(self._torso_center(closest, h, w))
-                return self._finalize(closest, h, w)
-            self._lock_miss += 1
-            if self._lock_miss < self._LOCK_EXPIRE:
-                return None
-            self._reset_lock()
-
+    def select_primary(self, pixel_xy: tuple, frame_hw: tuple = (480, 640)):
+        """
+        Tap-to-select: lock onto the person whose torso is closest to
+        *pixel_xy* (x, y in pixel coords).  Takes effect on the next
+        process_frame() call.
+        """
+        self._manual_lock_xy = pixel_xy
+        # Force re-acquisition
+        self._locked_torso = None
+        self._lock_vel = (0.0, 0.0)
+        self._lock_miss = 0
         self._pending_torso = None
         self._pending_count = 0
-
-        if ball_xy is not None:
-            chosen = self._nearest_to_ball(poses, ball_xy, h, w)
-        else:
-            chosen = poses[0]
-
-        self._commit_lock(self._torso_center(chosen, h, w))
-        self.person_switched = True
-        return self._finalize(chosen, h, w)
 
     def get_joint_angles(self, landmarks):
         shoulder = landmarks[PoseLandmark.RIGHT_SHOULDER]
@@ -241,33 +233,119 @@ class PoseEstimator:
     # Internals
     # ------------------------------------------------------------------ #
 
-    def _finalize(self, landmarks, h, w):
-        """Smooth keypoints via EMA then normalise to 0-1."""
-        self._smooth(landmarks)
+    def _select_primary(self, raw_poses, ball_xy, h, w):
+        """
+        Pick the primary player from raw_poses (pixel coords).
+        Returns (pose, index) or (None, -1).
+        """
+        n = len(raw_poses)
+
+        # ── Manual selection via tap ──
+        if self._manual_lock_xy is not None:
+            mx, my = self._manual_lock_xy
+            best_i, best_d = -1, float("inf")
+            for i, pose in enumerate(raw_poses):
+                tc = self._torso_center(pose, h, w)
+                d = math.hypot(tc[0] - mx, tc[1] - my)
+                if d < best_d:
+                    best_d = d
+                    best_i = i
+            if best_i >= 0:
+                tc = self._torso_center(raw_poses[best_i], h, w)
+                self._commit_lock(tc)
+                self._manual_lock_xy = None
+                self.person_switched = True
+                return raw_poses[best_i], best_i
+            self._manual_lock_xy = None
+
+        # ── Single person ──
+        if n == 1:
+            pose = raw_poses[0]
+            tc = self._torso_center(pose, h, w)
+
+            if self._locked_torso is None:
+                if self._pending_torso is not None:
+                    d = math.hypot(tc[0] - self._pending_torso[0],
+                                   tc[1] - self._pending_torso[1])
+                    if d < self._LOCK_RADIUS_PX:
+                        self._pending_count += 1
+                        self._pending_torso = tc
+                        if self._pending_count >= self._LOCK_INIT_FRAMES:
+                            self._commit_lock(tc)
+                    else:
+                        self._pending_torso = tc
+                        self._pending_count = 0
+                else:
+                    self._pending_torso = tc
+                    self._pending_count = 0
+                return pose, 0
+
+            if self._lock_dist(tc) > self._LOCK_RADIUS_PX:
+                self._lock_miss += 1
+                if self._lock_miss > self._LOCK_EXPIRE:
+                    self._reset_lock()
+                    self._pending_torso = tc
+                    self._pending_count = 0
+                    self.person_switched = True
+                    return pose, 0
+                return None, -1
+
+            self._commit_lock(tc)
+            return pose, 0
+
+        # ── Multiple people: prefer locked person, fall back to ball ──
+
+        if self._locked_torso is not None:
+            closest_i, dist = self._nearest_to_lock_idx(raw_poses, h, w)
+            if dist < self._LOCK_RADIUS_PX:
+                self._commit_lock(self._torso_center(raw_poses[closest_i], h, w))
+                return raw_poses[closest_i], closest_i
+            self._lock_miss += 1
+            if self._lock_miss < self._LOCK_EXPIRE:
+                return None, -1
+            self._reset_lock()
+
+        self._pending_torso = None
+        self._pending_count = 0
+
+        if ball_xy is not None:
+            chosen_i = self._nearest_to_ball_idx(raw_poses, ball_xy, h, w)
+        else:
+            chosen_i = 0
+
+        self._commit_lock(self._torso_center(raw_poses[chosen_i], h, w))
+        self.person_switched = True
+        return raw_poses[chosen_i], chosen_i
+
+    def _finalize(self, landmarks, h, w, person_key=0, smooth=True):
+        """Optionally smooth keypoints via EMA then normalise to 0-1."""
+        if smooth:
+            self._smooth(landmarks, person_key)
         for lm in landmarks:
             if lm.visibility > 0:
                 lm.x /= w
                 lm.y /= h
         return landmarks
 
-    def _smooth(self, landmarks):
+    def _smooth(self, landmarks, person_key=0):
         """Apply EMA smoothing to visible landmark positions (pixel coords)."""
         a = self._EMA_ALPHA
-        if self._smooth_buf is None:
-            self._smooth_buf = [
+        buf = self._smooth_bufs.get(person_key)
+        if buf is None:
+            self._smooth_bufs[person_key] = [
                 (lm.x, lm.y, lm.visibility) for lm in landmarks
             ]
             return
         for i, lm in enumerate(landmarks):
-            px, py, pv = self._smooth_buf[i]
+            px, py, pv = buf[i]
             if lm.visibility > 0.3 and pv > 0.3:
                 lm.x = px * (1 - a) + lm.x * a
                 lm.y = py * (1 - a) + lm.y * a
-                self._smooth_buf[i] = (lm.x, lm.y, lm.visibility)
+                buf[i] = (lm.x, lm.y, lm.visibility)
             elif lm.visibility > 0.3:
-                self._smooth_buf[i] = (lm.x, lm.y, lm.visibility)
+                buf[i] = (lm.x, lm.y, lm.visibility)
             else:
-                self._smooth_buf[i] = (px, py, pv * 0.8)
+                buf[i] = (px, py, pv * 0.8)
 
     def _reset_lock(self):
         self._locked_torso  = None
@@ -275,7 +353,7 @@ class PoseEstimator:
         self._lock_miss     = 0
         self._pending_torso = None
         self._pending_count = 0
-        self._smooth_buf    = None
+        self._smooth_bufs.clear()
 
     def _lock_dist(self, tc):
         px = self._locked_torso[0] + self._lock_vel[0]
@@ -302,25 +380,27 @@ class PoseEstimator:
             return (w / 2, h / 2)
         return (sum(xs) / len(xs), sum(ys) / len(ys))
 
-    def _nearest_to_lock(self, poses, h, w):
-        best, best_d = None, float("inf")
-        for pose in poses:
+    def _nearest_to_lock_idx(self, poses, h, w):
+        """Return (index, distance) of the pose closest to velocity-predicted lock."""
+        best_i, best_d = -1, float("inf")
+        for i, pose in enumerate(poses):
             tc = self._torso_center(pose, h, w)
             d = self._lock_dist(tc)
             if d < best_d:
                 best_d = d
-                best = pose
-        return best, best_d
+                best_i = i
+        return best_i, best_d
 
     @staticmethod
-    def _nearest_to_ball(poses, ball_xy, h, w):
+    def _nearest_to_ball_idx(poses, ball_xy, h, w):
+        """Return index of the pose whose wrist is closest to ball_xy."""
         bx, by = ball_xy
-        best, best_d = None, float("inf")
-        for pose in poses:
+        best_i, best_d = 0, float("inf")
+        for i, pose in enumerate(poses):
             for wrist_idx in (16, 15):
                 lm = pose[wrist_idx]
                 d = math.hypot(bx - lm.x, by - lm.y)
                 if d < best_d:
                     best_d = d
-                    best = pose
-        return best
+                    best_i = i
+        return best_i

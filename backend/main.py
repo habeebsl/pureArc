@@ -11,13 +11,16 @@ from detectors import (
     estimate_distance, draw_distance_overlay,
     ShotDetector,
     NetMotionDetector,
+    ShotMetricsEngine,
+    MistakeEngine,
 )
+from agents import AsyncLiveCoach, build_live_payload
 
 # RimDetector is kept as fallback when ShotDetector weights are unavailable
 _CUSTOM_WEIGHTS = os.path.join(os.path.dirname(__file__), "runs", "rim_detector", "weights", "best.pt")
 
 
-def draw_landmarks(frame, landmarks):
+def draw_landmarks(frame, landmarks, line_color=(0, 255, 0), point_color=(0, 0, 255), thickness=2):
     """Draw pose skeleton on frame using OpenCV."""
     h, w = frame.shape[:2]
 
@@ -29,13 +32,13 @@ def draw_landmarks(frame, landmarks):
             if start.visibility > 0.5 and end.visibility > 0.5:
                 pt1 = (int(start.x * w), int(start.y * h))
                 pt2 = (int(end.x * w),   int(end.y * h))
-                cv2.line(frame, pt1, pt2, (0, 255, 0), 2)
+                cv2.line(frame, pt1, pt2, line_color, thickness)
 
     # Draw landmark points
     for lm in landmarks:
         if lm.visibility > 0.5:
             cx, cy = int(lm.x * w), int(lm.y * h)
-            cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
+            cv2.circle(frame, (cx, cy), 4, point_color, -1)
 
 
 # Initialize pose estimator (downloads model on first run)
@@ -56,6 +59,12 @@ except FileNotFoundError as _e:
 
 # Net-motion make/miss detector — replaces trajectory-based scoring
 net_motion_detector = NetMotionDetector()
+
+# Shot metrics engine — collects per-frame data, computes per-shot metrics
+shot_metrics_engine = ShotMetricsEngine()
+mistake_engine = MistakeEngine()
+live_coach = AsyncLiveCoach.from_env()
+_frame_idx = 0
 
 # Score display persistence — keep "SCORE!" on screen for this many frames
 _SCORE_DISPLAY_FRAMES = 45
@@ -171,6 +180,8 @@ while cap.isOpened():
     if not ret:
         break
 
+    _frame_idx += 1
+
     # Keep native frame for shot detector — YOLO handles its own resize internally
     # and distorting portrait videos to 640×480 breaks coordinate geometry.
     _shot_frame = frame
@@ -179,6 +190,16 @@ while cap.isOpened():
 
     # Resize for performance (optional but recommended)
     frame = cv2.resize(frame, (640, 480))
+
+    # Drain any completed live-coach responses (async, non-blocking)
+    if live_coach is not None:
+        for msg in live_coach.poll():
+            if msg.kind == "coach":
+                print("\n--- Live Coach ---")
+                print(msg.text)
+            else:
+                print("\n--- Live Coach Error ---")
+                print(f"  {msg.text}")
 
     # Convert BGR → RGB
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -210,7 +231,8 @@ while cap.isOpened():
 
     # Pass ball position so PoseEstimator picks the ball-handler
     # when multiple people are in frame.
-    landmarks = pose_estimator.process_frame(frame_rgb, ball_xy=_pose_ball_xy)
+    pose_result = pose_estimator.process_frame(frame_rgb, ball_xy=_pose_ball_xy)
+    landmarks = pose_result.primary  # primary player (may be None)
 
     # When the pose tracker switches to a different person, flush the
     # release detector buffers — stale data from another player's pose
@@ -228,8 +250,12 @@ while cap.isOpened():
 
         elbow = angles['elbow_angle']
 
-        # Draw skeleton
-        draw_landmarks(frame, landmarks)
+    # Draw all detected skeletons — primary in green, others in gray
+    for i, pose_lms in enumerate(pose_result.all_poses):
+        if i == pose_result.primary_idx:
+            draw_landmarks(frame, pose_lms, line_color=(0, 255, 0), point_color=(0, 0, 255))
+        else:
+            draw_landmarks(frame, pose_lms, line_color=(130, 130, 130), point_color=(100, 100, 100), thickness=1)
 
     # Derive hoop position from the shot detector; fall back to RimDetector when unavailable.
     if shot_result is not None and shot_result["hoop_bbox"]:
@@ -244,6 +270,14 @@ while cap.isOpened():
         }
     else:
         rim_result = _rim_detector_fallback.detect_rim(frame)
+
+    # ── Feed shot metrics engine ─────────────────────────────────────
+    _rim_center = rim_result["center"] if rim_result and "center" in rim_result else None
+    _angles_for_metrics = angles if landmarks else None
+    shot_metrics_engine.feed(
+        _frame_idx, landmarks, _last_ball_xy, _rim_center,
+        _angles_for_metrics, frame_hw=(480, 640),
+    )
 
     # Always draw ball detection result so we can visually verify it independently
     if ball_result:
@@ -316,6 +350,7 @@ while cap.isOpened():
         if result['release']:
             print(f"RELEASE DETECTED  confidence={result['confidence']:.2f}  signals={result['signals']}")
             _release_display_cnt = _RELEASE_DISPLAY_FRAMES
+            shot_metrics_engine.on_release(_frame_idx)
 
     # Persist RELEASE text for 30 frames
     if _release_display_cnt > 0:
@@ -357,7 +392,42 @@ while cap.isOpened():
 
     # Handle a confirmed make or miss from NET MOTION
     if net_result["attempt"]:
-        if net_result["make"]:
+        _is_make = net_result["make"]
+
+        # Compute shot metrics for this attempt
+        _shot_metrics = shot_metrics_engine.on_result(_frame_idx, made=_is_make)
+        if _shot_metrics is not None:
+            print(f"\n{'='*50}")
+            print(f"SHOT METRICS  ({'MAKE' if _is_make else 'MISS'})")
+            print(f"  Release angle:   {_shot_metrics.release_angle}")
+            print(f"  Release height:  {_shot_metrics.release_height}")
+            print(f"  Elbow angle:     {_shot_metrics.elbow_angle}")
+            print(f"  Shot distance:   {_shot_metrics.shot_distance_px}")
+            print(f"  Arc peak (px):   {_shot_metrics.arc_peak}")
+            print(f"  Arc height ratio:{_shot_metrics.arc_height_ratio}")
+            print(f"  Arc symmetry:    {_shot_metrics.arc_symmetry}")
+            print(f"  Knee-elbow lag:  {_shot_metrics.knee_elbow_lag} frames")
+            print(f"  Shot tempo:      {_shot_metrics.shot_tempo} frames")
+            print(f"  Torso drift:     {_shot_metrics.torso_drift} px")
+            mistakes = mistake_engine.analyse(_shot_metrics)
+            if mistakes:
+                print(f"  --- Coaching Cues ---")
+                for mk in mistakes:
+                    print(f"  [{mk.severity.value:8s}] {mk.tag}: {mk.message}")
+            if live_coach is not None:
+                payload = build_live_payload(
+                    _shot_metrics,
+                    mistakes,
+                    _is_make,
+                    fps=30,
+                    dist_result=dist_result,
+                )
+                if not live_coach.submit(payload):
+                    print("  --- Live Coach ---")
+                    print("  queue full, skipping this shot's LLM call")
+            print(f"{'='*50}\n")
+
+        if _is_make:
             _score_total      += 1
             _overlay_color     = (0, 255, 0)    # green flash
             _overlay_text      = "Make"
@@ -396,6 +466,8 @@ while cap.isOpened():
 
 cap.release()
 out.release()
+if live_coach is not None:
+    live_coach.close()
 
 # Re-encode to H.264 so the file plays in browsers and uploads to social media
 subprocess.run(

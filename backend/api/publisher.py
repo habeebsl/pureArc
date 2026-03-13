@@ -30,6 +30,16 @@ class ReplayPublisherClient:
         self._session_id: str | None = None
         self.last_error: str | None = None
 
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
+
+    def ensure_session(self) -> str | None:
+        """Ensure backend session exists and return session_id."""
+        if self._ensure_session():
+            return self._session_id
+        return None
+
     @classmethod
     def from_env(
         cls,

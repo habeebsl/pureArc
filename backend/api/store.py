@@ -5,7 +5,7 @@ import uuid
 from dataclasses import dataclass, field
 from threading import Lock
 
-from .models import ShotCreateRequest, ShotDetailResponse, ShotListItem
+from .models import SessionSummary, ShotCreateRequest, ShotDetailResponse, ShotListItem
 
 
 @dataclass
@@ -43,6 +43,27 @@ class InMemoryStore:
     def get_session(self, session_id: str) -> SessionState | None:
         with self._lock:
             return self._sessions.get(session_id)
+
+    def list_sessions(self) -> list[SessionSummary]:
+        with self._lock:
+            items: list[SessionSummary] = []
+            for session in sorted(self._sessions.values(), key=lambda s: s.created_at_ms, reverse=True):
+                items.append(
+                    SessionSummary(
+                        session_id=session.session_id,
+                        user_id=session.user_id,
+                        device=session.device,
+                        fps=session.fps,
+                        resolution=session.resolution,
+                        created_at_ms=session.created_at_ms,
+                        shot_count=len(session.shots),
+                    )
+                )
+            return items
+
+    def latest_session(self) -> SessionSummary | None:
+        sessions = self.list_sessions()
+        return sessions[0] if sessions else None
 
     def ingest_frame(self, session_id: str) -> str:
         with self._lock:

@@ -2,7 +2,6 @@ import cv2
 import os
 import math
 import subprocess
-import tempfile
 import numpy as np
 from detectors import (
     PoseEstimator, POSE_CONNECTIONS,
@@ -16,6 +15,7 @@ from detectors import (
 )
 from agents import AsyncLiveCoach, build_live_payload
 from api.publisher import ReplayPublisherClient
+from replay import ShotClipBuffer
 
 # RimDetector is kept as fallback when ShotDetector weights are unavailable
 _CUSTOM_WEIGHTS = os.path.join(os.path.dirname(__file__), "runs", "rim_detector", "weights", "best.pt")
@@ -66,6 +66,7 @@ shot_metrics_engine = ShotMetricsEngine()
 mistake_engine = MistakeEngine()
 live_coach = AsyncLiveCoach.from_env()
 replay_publisher = ReplayPublisherClient.from_env(fps=30, resolution=[640, 480])
+_replay_session_logged = False
 _frame_idx = 0
 
 # Score display persistence — keep "SCORE!" on screen for this many frames
@@ -168,14 +169,35 @@ def _update_ball_smooth(raw_xy):
     elif _ball_smooth_xy is not None:
         _last_ball_xy = (int(_ball_smooth_xy[0]), int(_ball_smooth_xy[1]))
 
-# Load video (replace with your file)
-cap = cv2.VideoCapture("test_shot8.mp4")
+# ── Input source / output config ───────────────────────────────────────
+_video_source = os.getenv("PUREARC_VIDEO_SOURCE", "test_shot8.mp4")
+if _video_source.isdigit():
+    _video_source = int(_video_source)
 
-# Set up video writer — write raw mp4v to a temp file, re-encode to H.264 at the end
+cap = cv2.VideoCapture(_video_source)
+if not cap.isOpened():
+    raise RuntimeError(f"Failed to open video source: {_video_source}")
+
+print(f"Video source: {_video_source}")
+
+_capture_fps = int(cap.get(cv2.CAP_PROP_FPS) or 30)
+if _capture_fps <= 0:
+    _capture_fps = 30
+
+_save_output = os.getenv("PUREARC_SAVE_OUTPUT", "1") == "1"
 _OUTPUT_FILE = "output.mp4"
 _TEMP_FILE   = "output_tmp.mp4"
-fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-out = cv2.VideoWriter(_TEMP_FILE, fourcc, 30.0, (640, 480))
+out = None
+if _save_output:
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(_TEMP_FILE, fourcc, float(_capture_fps), (640, 480))
+
+clip_buffer = ShotClipBuffer(
+    fps=_capture_fps,
+    frame_size=(640, 480),
+    pre_seconds=4.0,
+    output_dir="replays",
+)
 
 while cap.isOpened():
     ret, frame = cap.read()
@@ -192,6 +214,17 @@ while cap.isOpened():
 
     # Resize for performance (optional but recommended)
     frame = cv2.resize(frame, (640, 480))
+    clip_buffer.push(frame)
+
+    if replay_publisher is not None and not _replay_session_logged:
+        _session_id = replay_publisher.ensure_session()
+        if _session_id:
+            print(f"Replay API session: {_session_id}")
+            print(f"Replay list endpoint: /session/{_session_id}/shots")
+            _replay_session_logged = True
+        elif replay_publisher.last_error:
+            print("Replay API session init error:")
+            print(f"  {replay_publisher.last_error}")
 
     # Drain any completed live-coach responses (async, non-blocking)
     if live_coach is not None:
@@ -418,14 +451,19 @@ while cap.isOpened():
                     print(f"  [{mk.severity.value:8s}] {mk.tag}: {mk.message}")
 
             if replay_publisher is not None:
+                clip_tag = "make" if _is_make else "miss"
+                clip_url = clip_buffer.save_recent_clip(clip_tag)
                 published_shot_id = replay_publisher.publish_shot(
                     made=_is_make,
                     shot_metrics=_shot_metrics,
                     mistakes=mistakes,
                     dist_result=dist_result,
+                    clip_url=clip_url,
                 )
                 if published_shot_id:
                     print(f"  Replay stored: {published_shot_id}")
+                    if clip_url:
+                        print(f"  Replay clip: {clip_url}")
                 elif replay_publisher.last_error:
                     print("  --- Replay Publish Error ---")
                     print(f"  {replay_publisher.last_error}")
@@ -478,21 +516,24 @@ while cap.isOpened():
                     cv2.FONT_HERSHEY_DUPLEX, 1.6, (0, 255, 80), 4)
         cv2.addWeighted(ov, ba, frame, 1 - ba, 0, frame)
 
-    out.write(frame)
+    if out is not None:
+        out.write(frame)
 
 cap.release()
-out.release()
+if out is not None:
+    out.release()
 if live_coach is not None:
     live_coach.close()
 
-# Re-encode to H.264 so the file plays in browsers and uploads to social media
-subprocess.run(
-    ["ffmpeg", "-y", "-i", _TEMP_FILE,
-     "-vcodec", "libx264", "-crf", "23",
-     "-preset", "fast", "-pix_fmt", "yuv420p",
-     "-movflags", "+faststart",
-     _OUTPUT_FILE],
-    check=True
-)
-os.remove(_TEMP_FILE)
-print(f"Output saved to {_OUTPUT_FILE} (H.264)")
+if _save_output:
+    # Re-encode to H.264 so the file plays in browsers and uploads to social media
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", _TEMP_FILE,
+         "-vcodec", "libx264", "-crf", "23",
+         "-preset", "fast", "-pix_fmt", "yuv420p",
+         "-movflags", "+faststart",
+         _OUTPUT_FILE],
+        check=True
+    )
+    os.remove(_TEMP_FILE)
+    print(f"Output saved to {_OUTPUT_FILE} (H.264)")

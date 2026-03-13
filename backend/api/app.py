@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+from pathlib import Path
 import time
 from collections import defaultdict
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 
 from .models import (
     FrameIngestResponse,
     ReplayAnalysisRequest,
     ReplayAnalysisResponse,
+    SessionLatestResponse,
     SessionStartRequest,
     SessionStartResponse,
+    SessionSummary,
     ShotCreateRequest,
     ShotDetailResponse,
     ShotListItem,
@@ -20,6 +24,7 @@ from .replay import build_replay_analysis
 from .store import store
 
 app = FastAPI(title="PureArc API", version="0.1.0")
+_BACKEND_ROOT = Path(__file__).resolve().parent.parent
 
 _ws_clients: dict[str, list[WebSocket]] = defaultdict(list)
 
@@ -36,6 +41,16 @@ def start_session(req: SessionStartRequest) -> SessionStartResponse:
         session_id=session.session_id,
         ws_url=f"/session/{session.session_id}/events",
     )
+
+
+@app.get("/sessions", response_model=list[SessionSummary])
+def list_sessions() -> list[SessionSummary]:
+    return store.list_sessions()
+
+
+@app.get("/session/latest", response_model=SessionLatestResponse)
+def latest_session() -> SessionLatestResponse:
+    return SessionLatestResponse(session=store.latest_session())
 
 
 @app.post("/session/{session_id}/frame", response_model=FrameIngestResponse)
@@ -96,11 +111,22 @@ def get_shot_clip(shot_id: str) -> dict:
     shot = store.get_shot(shot_id)
     if shot is None:
         raise HTTPException(status_code=404, detail="shot not found")
-    return {
-        "shot_id": shot_id,
-        "clip_url": shot.clip_url,
-        "message": "Clip retrieval scaffolded; wire actual video storage next.",
-    }
+    if not shot.clip_url:
+        raise HTTPException(status_code=404, detail="clip not available for this shot")
+
+    clip_ref = shot.clip_url
+    clip_path = Path(clip_ref)
+    if not clip_path.is_absolute():
+        clip_path = (_BACKEND_ROOT / clip_path).resolve()
+
+    if not clip_path.exists() or not clip_path.is_file():
+        raise HTTPException(status_code=404, detail="clip file not found")
+
+    return FileResponse(
+        str(clip_path),
+        media_type="video/mp4",
+        filename=clip_path.name,
+    )
 
 
 @app.post("/shots/{shot_id}/replay-analysis", response_model=ReplayAnalysisResponse)

@@ -25,6 +25,20 @@ class SessionStartResponse(BaseModel):
     ws_url: str
 
 
+class SessionSummary(BaseModel):
+    session_id: str
+    user_id: str
+    device: str
+    fps: int
+    resolution: list[int]
+    created_at_ms: int
+    shot_count: int
+
+
+class SessionLatestResponse(BaseModel):
+    session: SessionSummary | None = None
+
+
 class FrameIngestResponse(BaseModel):
     accepted: bool
     frame_id: str

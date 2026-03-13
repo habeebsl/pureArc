@@ -15,6 +15,7 @@ from detectors import (
     MistakeEngine,
 )
 from agents import AsyncLiveCoach, build_live_payload
+from api.publisher import ReplayPublisherClient
 
 # RimDetector is kept as fallback when ShotDetector weights are unavailable
 _CUSTOM_WEIGHTS = os.path.join(os.path.dirname(__file__), "runs", "rim_detector", "weights", "best.pt")
@@ -64,6 +65,7 @@ net_motion_detector = NetMotionDetector()
 shot_metrics_engine = ShotMetricsEngine()
 mistake_engine = MistakeEngine()
 live_coach = AsyncLiveCoach.from_env()
+replay_publisher = ReplayPublisherClient.from_env(fps=30, resolution=[640, 480])
 _frame_idx = 0
 
 # Score display persistence — keep "SCORE!" on screen for this many frames
@@ -414,6 +416,20 @@ while cap.isOpened():
                 print(f"  --- Coaching Cues ---")
                 for mk in mistakes:
                     print(f"  [{mk.severity.value:8s}] {mk.tag}: {mk.message}")
+
+            if replay_publisher is not None:
+                published_shot_id = replay_publisher.publish_shot(
+                    made=_is_make,
+                    shot_metrics=_shot_metrics,
+                    mistakes=mistakes,
+                    dist_result=dist_result,
+                )
+                if published_shot_id:
+                    print(f"  Replay stored: {published_shot_id}")
+                elif replay_publisher.last_error:
+                    print("  --- Replay Publish Error ---")
+                    print(f"  {replay_publisher.last_error}")
+
             if live_coach is not None:
                 payload = build_live_payload(
                     _shot_metrics,

@@ -115,6 +115,7 @@ class DrillPlan(BaseModel):
     name: str
     duration_min: int
     steps: list[str]
+    links: list[str] = Field(default_factory=list)
 
 
 class ReplayAnalysisResponse(BaseModel):
@@ -122,6 +123,9 @@ class ReplayAnalysisResponse(BaseModel):
     what_went_well: list[str]
     what_to_fix: list[str]
     drill: DrillPlan | None = None
+    backup_drill: DrillPlan | None = None
+    links_provider: str | None = None
+    links_errors: list[str] = Field(default_factory=list)
     general_recommendations: list[str]
 
 

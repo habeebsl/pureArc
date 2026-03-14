@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .drill_links import fetch_drill_links
 from .models import DrillPlan, ReplayAnalysisResponse, ShotDetailResponse
 
 
@@ -41,8 +42,17 @@ def build_replay_analysis(shot: ShotDetailResponse, include_drill: bool) -> Repl
         to_fix.append("No major issues flagged on this shot.")
 
     drill = None
+    backup_drill = None
+    links_provider = None
+    links_errors: list[str] = []
     if include_drill:
-        drill = _pick_drill(shot)
+        primary_name, backup_name = _pick_drill_names(shot)
+        title_order = [primary_name] + ([backup_name] if backup_name else [])
+        links_map, links_provider, links_errors = fetch_drill_links(title_order, max_results_per_drill=2)
+
+        drill = _build_drill_plan(primary_name, links_map.get(primary_name, []))
+        if backup_name:
+            backup_drill = _build_drill_plan(backup_name, links_map.get(backup_name, []))
 
     recommendations = [
         "Track 10-shot trends instead of one-shot outcomes.",
@@ -55,41 +65,116 @@ def build_replay_analysis(shot: ShotDetailResponse, include_drill: bool) -> Repl
         what_went_well=went_well[:4],
         what_to_fix=to_fix[:5],
         drill=drill,
+        backup_drill=backup_drill,
+        links_provider=links_provider,
+        links_errors=links_errors,
         general_recommendations=recommendations,
     )
 
 
-def _pick_drill(shot: ShotDetailResponse) -> DrillPlan:
-    metrics = shot.metrics
+def _pick_drill_names(shot: ShotDetailResponse) -> tuple[str, str | None]:
+    # First priority: map explicit mistake tags
+    tags = [m.tag for m in shot.mistakes]
 
-    if metrics.arc_height_ratio is not None and metrics.arc_height_ratio < 0.35:
-        return DrillPlan(
-            name="One-Hand Arc Control",
-            duration_min=8,
-            steps=[
-                "Stand 6-8 ft from rim and shoot one-handed with guide hand off ball.",
-                "Focus on lifting elbow and finishing high with wrist snap.",
-                "Complete 3 sets of 12 reps, logging arc consistency.",
+    if "flat_arc" in tags:
+        return "Off-the-Dribble Form Shooting", "Partner Shooting"
+    if "rushed_shot" in tags:
+        return "Hand-Off Shooting Drill", "Speed Shooting Drill"
+    if "fading" in tags:
+        return "Speed Shooting Drill", "Off-the-Dribble Form Shooting"
+    if "arm_shooting" in tags:
+        return "Partner Shooting", "Titan Shooting"
+    if "asymmetric_arc" in tags:
+        return "Rainbow Shooting", "Partner Shooting"
+
+    # Fallback from metric thresholds
+    m = shot.metrics
+    if m.arc_height_ratio is not None and m.arc_height_ratio < 0.35:
+        return "Off-the-Dribble Form Shooting", "Partner Shooting"
+    if m.torso_drift is not None and m.torso_drift > 30:
+        return "Speed Shooting Drill", "Partner Shooting"
+
+    return "5 Spot Variety Shooting", "31 Shooting Drill"
+
+
+def _build_drill_plan(name: str, links: list[str]) -> DrillPlan:
+    library: dict[str, tuple[int, list[str]]] = {
+        "Hand-Off Shooting Drill": (
+            8,
+            [
+                "Start near top of key and receive a hand-off.",
+                "Take 1-2 rhythm steps into shot.",
+                "Repeat for 3 sets of 10 reps.",
             ],
-        )
-
-    if metrics.torso_drift is not None and metrics.torso_drift > 30:
-        return DrillPlan(
-            name="Balance Stick Landing",
-            duration_min=8,
-            steps=[
-                "Shoot from mid-range and hold landing for 2 seconds each rep.",
-                "Keep nose, chest, and hips stacked toward target.",
-                "Complete 3 sets of 10 reps; restart rep if landing drifts.",
+        ),
+        "Speed Shooting Drill": (
+            8,
+            [
+                "Sprint, stop on balance, and shoot immediately.",
+                "Rebound and sprint back each rep.",
+                "Complete 3 rounds of 8 makes.",
             ],
-        )
+        ),
+        "Off-the-Dribble Form Shooting": (
+            10,
+            [
+                "Use controlled 1-2 footwork off dribble.",
+                "Focus on balanced rise and high finish.",
+                "Do 3 sets of 12 pull-up reps.",
+            ],
+        ),
+        "Partner Shooting": (
+            8,
+            [
+                "Shooter works at game rhythm while partner rebounds.",
+                "Backpedal to spot and catch into shot.",
+                "Make 40 total shots.",
+            ],
+        ),
+        "Titan Shooting": (
+            8,
+            [
+                "Rotate lines after every rep to add conditioning.",
+                "Keep same form under fatigue.",
+                "Complete 3 full line cycles.",
+            ],
+        ),
+        "Rainbow Shooting": (
+            8,
+            [
+                "Move through multiple spots around the arc.",
+                "Emphasize identical release rhythm at each spot.",
+                "Complete 2 rainbow cycles.",
+            ],
+        ),
+        "5 Spot Variety Shooting": (
+            10,
+            [
+                "Shoot from five spots around court.",
+                "Take different shot types per spot.",
+                "Track makes to monitor consistency.",
+            ],
+        ),
+        "31 Shooting Drill": (
+            10,
+            [
+                "Alternate inside, mid-range, and 3-point attempts.",
+                "Score each make and race to 31 points.",
+                "Reset and repeat with same form cues.",
+            ],
+        ),
+    }
 
-    return DrillPlan(
-        name="Form-to-Game-Speed Ladder",
-        duration_min=10,
-        steps=[
-            "5 close form shots, 5 mid-range rhythm shots, 5 game-speed shots.",
-            "Keep same release cues across all phases.",
-            "Repeat ladder twice and compare make rate + consistency.",
-        ],
+    duration, steps = library.get(
+        name,
+        (
+            8,
+            [
+                "Shoot with consistent rhythm and balance.",
+                "Track makes and misses each set.",
+                "Adjust one cue at a time.",
+            ],
+        ),
     )
+
+    return DrillPlan(name=name, duration_min=duration, steps=steps, links=links)

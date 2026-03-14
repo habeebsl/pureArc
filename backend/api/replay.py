@@ -62,6 +62,7 @@ def build_replay_analysis(shot: ShotDetailResponse, include_drill: bool) -> Repl
 
     return ReplayAnalysisResponse(
         shot_id=shot.shot_id,
+        moment_annotations=[],
         what_went_well=went_well[:4],
         what_to_fix=to_fix[:5],
         drill=drill,
@@ -69,6 +70,7 @@ def build_replay_analysis(shot: ShotDetailResponse, include_drill: bool) -> Repl
         links_provider=links_provider,
         links_errors=links_errors,
         general_recommendations=recommendations,
+        next_shot_focus=to_fix[0] if to_fix else None,
     )
 
 

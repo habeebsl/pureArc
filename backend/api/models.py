@@ -118,8 +118,17 @@ class DrillPlan(BaseModel):
     links: list[str] = Field(default_factory=list)
 
 
+class MomentAnnotation(BaseModel):
+    t_sec: float
+    frame_idx: int
+    tag: str
+    observation: str
+    correction: str
+
+
 class ReplayAnalysisResponse(BaseModel):
     shot_id: str
+    moment_annotations: list[MomentAnnotation] = Field(default_factory=list)
     what_went_well: list[str]
     what_to_fix: list[str]
     drill: DrillPlan | None = None
@@ -127,6 +136,7 @@ class ReplayAnalysisResponse(BaseModel):
     links_provider: str | None = None
     links_errors: list[str] = Field(default_factory=list)
     general_recommendations: list[str]
+    next_shot_focus: str | None = None
 
 
 class WsEvent(BaseModel):

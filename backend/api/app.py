@@ -6,6 +6,7 @@ from collections import defaultdict
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
+from agents.replay_coach import ReplayCoachClient
 
 from .models import (
     FrameIngestResponse,
@@ -27,6 +28,7 @@ app = FastAPI(title="PureArc API", version="0.1.0")
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 
 _ws_clients: dict[str, list[WebSocket]] = defaultdict(list)
+_replay_coach = ReplayCoachClient.from_env()
 
 
 @app.get("/health")
@@ -134,7 +136,16 @@ def replay_analysis(shot_id: str, req: ReplayAnalysisRequest) -> ReplayAnalysisR
     shot = store.get_shot(shot_id)
     if shot is None:
         raise HTTPException(status_code=404, detail="shot not found")
-    return build_replay_analysis(shot, include_drill=req.include_drill)
+    base = build_replay_analysis(shot, include_drill=req.include_drill)
+
+    if _replay_coach is None:
+        return base
+
+    enhanced = _replay_coach.enhance(shot=shot, deterministic=base, detail_level=req.detail_level)
+    if enhanced is not None:
+        return enhanced
+
+    return base
 
 
 @app.websocket("/session/{session_id}/events")

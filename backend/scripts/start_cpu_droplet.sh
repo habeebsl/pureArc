@@ -13,9 +13,24 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements-cpu.txt
 
 if [[ -f .env ]]; then
-  set -a
-  source .env
-  set +a
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "$line" ]] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+    [[ "$line" != *=* ]] && continue
+
+    key="${line%%=*}"
+    val="${line#*=}"
+
+    key="$(echo "$key" | xargs)"
+
+    if [[ "$val" =~ ^\".*\"$ ]] || [[ "$val" =~ ^\'.*\'$ ]]; then
+      val="${val:1:${#val}-2}"
+    fi
+
+    export "$key=$val"
+  done < .env
 fi
 
 mkdir -p logs

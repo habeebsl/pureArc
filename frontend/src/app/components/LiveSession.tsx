@@ -1,4 +1,4 @@
-import { Shot, USE_MOCK } from "../../api";
+import { Shot, USE_MOCK, sendFrame } from "../../api";
 import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router";
 import { motion, AnimatePresence } from "motion/react";
@@ -52,6 +52,8 @@ export function LiveSession() {
   const [cameraError, setCameraError] = useState<string | null>(null);
   const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const frameLoopRef = useRef<number | null>(null);
 
   // Redirect if no session
   useEffect(() => {
@@ -142,7 +144,70 @@ export function LiveSession() {
     video.play().catch(() => null);
   }, [cameraState]);
 
+  // Frame streaming: capture video → JPEG → POST to backend (~4 fps)
+  useEffect(() => {
+    if (cameraState !== "ready" || !session || USE_MOCK) return;
+
+    const FRAME_INTERVAL_MS = 250; // ~4 fps
+    const CAPTURE_WIDTH = 640;
+    const CAPTURE_HEIGHT = 480;
+
+    let lastSendTime = 0;
+    let sending = false;
+
+    // Create offscreen canvas once
+    if (!canvasRef.current) {
+      canvasRef.current = document.createElement("canvas");
+    }
+    const canvas = canvasRef.current;
+    canvas.width = CAPTURE_WIDTH;
+    canvas.height = CAPTURE_HEIGHT;
+    const ctx = canvas.getContext("2d");
+
+    const captureLoop = () => {
+      frameLoopRef.current = requestAnimationFrame(captureLoop);
+
+      const now = performance.now();
+      if (now - lastSendTime < FRAME_INTERVAL_MS) return;
+      if (sending) return;
+
+      const video = cameraVideoRef.current;
+      if (!video || video.readyState < 2) return;
+
+      lastSendTime = now;
+      sending = true;
+
+      ctx?.drawImage(video, 0, 0, CAPTURE_WIDTH, CAPTURE_HEIGHT);
+      canvas.toBlob(
+        (blob) => {
+          if (blob && session) {
+            sendFrame(session.session_id, blob).finally(() => {
+              sending = false;
+            });
+          } else {
+            sending = false;
+          }
+        },
+        "image/jpeg",
+        0.7
+      );
+    };
+
+    frameLoopRef.current = requestAnimationFrame(captureLoop);
+
+    return () => {
+      if (frameLoopRef.current) {
+        cancelAnimationFrame(frameLoopRef.current);
+        frameLoopRef.current = null;
+      }
+    };
+  }, [cameraState, session]);
+
   const handleEnd = () => {
+    if (frameLoopRef.current) {
+      cancelAnimationFrame(frameLoopRef.current);
+      frameLoopRef.current = null;
+    }
     if (cameraStreamRef.current) {
       cameraStreamRef.current.getTracks().forEach((track) => track.stop());
       cameraStreamRef.current = null;

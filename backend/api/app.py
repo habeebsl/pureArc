@@ -4,12 +4,16 @@ from pathlib import Path
 import time
 from collections import defaultdict
 
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+import cv2
+import numpy as np
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from agents.replay_coach import ReplayCoachClient
+from pipeline import Pipeline, ShotEvent
 
 from .models import (
     FrameIngestResponse,
+    MistakePayload,
     ReplayAnalysisRequest,
     ReplayAnalysisResponse,
     SessionLatestResponse,
@@ -19,6 +23,7 @@ from .models import (
     ShotCreateRequest,
     ShotDetailResponse,
     ShotListItem,
+    ShotMetricsPayload,
     WsEvent,
 )
 from .replay import build_replay_analysis
@@ -29,6 +34,7 @@ _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 
 _ws_clients: dict[str, list[WebSocket]] = defaultdict(list)
 _replay_coach = ReplayCoachClient.from_env()
+_pipelines: dict[str, Pipeline] = {}  # session_id -> Pipeline
 
 
 @app.get("/health")
@@ -55,6 +61,42 @@ def latest_session() -> SessionLatestResponse:
     return SessionLatestResponse(session=store.latest_session())
 
 
+def _get_pipeline(session_id: str) -> Pipeline:
+    """Return (or create) the CV pipeline for a session."""
+    if session_id not in _pipelines:
+        _pipelines[session_id] = Pipeline()
+    return _pipelines[session_id]
+
+
+def _shot_event_to_request(event: ShotEvent) -> ShotCreateRequest:
+    """Convert a pipeline ShotEvent into a ShotCreateRequest for the store."""
+    m = event.metrics
+    return ShotCreateRequest(
+        made=event.made,
+        timestamp_ms=int(time.time() * 1000),
+        metrics=ShotMetricsPayload(
+            release_angle=m.release_angle,
+            release_height=m.release_height,
+            elbow_angle=m.elbow_angle,
+            shot_distance_px=m.shot_distance_px,
+            arc_height_ratio=m.arc_height_ratio,
+            arc_symmetry=m.arc_symmetry,
+            knee_elbow_lag=m.knee_elbow_lag,
+            shot_tempo=m.shot_tempo,
+            torso_drift=m.torso_drift,
+        ),
+        mistakes=[
+            MistakePayload(
+                tag=mk.tag,
+                severity=mk.severity.value,
+                message=mk.message,
+                value=mk.value,
+            )
+            for mk in event.mistakes
+        ],
+    )
+
+
 @app.post("/session/{session_id}/frame", response_model=FrameIngestResponse)
 async def ingest_frame(
     session_id: str,
@@ -65,9 +107,33 @@ async def ingest_frame(
     if session is None:
         raise HTTPException(status_code=404, detail="session not found")
 
-    _ = await frame.read()
+    raw_bytes = await frame.read()
     frame_id = store.ingest_frame(session_id)
     ts = timestamp_ms if timestamp_ms is not None else int(time.time() * 1000)
+
+    # Decode JPEG/PNG into a BGR numpy array and run the CV pipeline
+    np_arr = np.frombuffer(raw_bytes, np.uint8)
+    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    if img is not None:
+        pipe = _get_pipeline(session_id)
+        event = pipe.process_frame(img)
+
+        if event is not None:
+            req = _shot_event_to_request(event)
+            shot = store.add_shot(session_id, req)
+
+            await _broadcast(
+                session_id,
+                WsEvent(
+                    event="shot_result",
+                    payload={
+                        "shot_id": shot.shot_id,
+                        "made": shot.made,
+                        "timestamp_ms": shot.timestamp_ms,
+                    },
+                ),
+            )
+
     return FrameIngestResponse(accepted=True, frame_id=frame_id, timestamp_ms=ts)
 
 

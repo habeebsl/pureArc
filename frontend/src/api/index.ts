@@ -325,3 +325,24 @@ export async function analyzeReplay(
 }
 
 export { USE_MOCK };
+
+/**
+ * Send a camera frame (JPEG blob) to the backend for CV processing.
+ * Fire-and-forget — errors are silently ignored so the stream keeps going.
+ */
+export async function sendFrame(
+  sessionId: string,
+  blob: Blob
+): Promise<void> {
+  if (USE_MOCK) return;
+  const form = new FormData();
+  form.append("frame", blob, "frame.jpg");
+  try {
+    await fetch(`${BASE_URL}/session/${sessionId}/frame`, {
+      method: "POST",
+      body: form,
+    });
+  } catch {
+    // silently ignore — next frame will retry
+  }
+}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 import time
 from collections import defaultdict
@@ -10,6 +11,9 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, W
 from fastapi.responses import FileResponse
 from agents.replay_coach import ReplayCoachClient
 from pipeline import Pipeline, ShotEvent
+
+logger = logging.getLogger("purearc.api")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
 from .models import (
     FrameIngestResponse,
@@ -116,9 +120,18 @@ async def ingest_frame(
     img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
     if img is not None:
         pipe = _get_pipeline(session_id)
-        event = pipe.process_frame(img)
+        try:
+            event = pipe.process_frame(img)
+        except Exception:
+            logger.exception("Pipeline error on frame %s (session %s)", frame_id, session_id)
+            event = None
 
         if event is not None:
+            logger.info(
+                "SHOT DETECTED session=%s made=%s metrics_elbow=%s",
+                session_id, event.made,
+                event.metrics.elbow_angle,
+            )
             req = _shot_event_to_request(event)
             shot = store.add_shot(session_id, req)
 
@@ -133,6 +146,8 @@ async def ingest_frame(
                     },
                 ),
             )
+    else:
+        logger.warning("Frame %s decode failed (session %s)", frame_id, session_id)
 
     return FrameIngestResponse(accepted=True, frame_id=frame_id, timestamp_ms=ts)
 
@@ -212,6 +227,31 @@ def replay_analysis(shot_id: str, req: ReplayAnalysisRequest) -> ReplayAnalysisR
         return enhanced
 
     return base
+
+
+@app.get("/session/{session_id}/pipeline-status")
+def pipeline_status(session_id: str) -> dict:
+    """Debug endpoint: returns pipeline detector states."""
+    session = store.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    pipe = _pipelines.get(session_id)
+    if pipe is None:
+        return {"pipeline": "not_initialized", "frames_processed": 0}
+    net = pipe.net_motion_detector
+    return {
+        "pipeline": "active",
+        "frames_processed": pipe._frame_idx,
+        "shot_detector_available": pipe.shot_detector is not None,
+        "net_motion": {
+            "state": net._state,
+            "makes": net.makes,
+            "attempts": net.attempts,
+            "baseline": net._get_baseline(),
+            "last_decision": net.last_decision,
+            "cooldown_remaining": net._cooldown_cnt,
+        },
+    }
 
 
 @app.websocket("/session/{session_id}/events")

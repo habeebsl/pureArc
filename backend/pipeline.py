@@ -252,10 +252,16 @@ class Pipeline:
             )
             if result["release"]:
                 self.shot_metrics_engine.on_release(self._frame_idx)
+                self._release_detected = True
+            else:
+                self._release_detected = False
 
         # --- Net-motion make/miss ---
         hoop_bbox = rim_result["bbox"] if rim_result and "bbox" in rim_result else None
         armed = shot_result is not None and shot_result["state"] == "ARMED"
+        # When ShotDetector is unavailable, use release detection as arm signal
+        if not armed and self.shot_detector is None and hasattr(self, '_release_detected') and self._release_detected:
+            armed = True
         net_result = self.net_motion_detector.update(frame_resized, hoop_bbox, armed)
 
         if net_result["attempt"]:

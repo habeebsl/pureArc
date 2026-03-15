@@ -60,6 +60,7 @@ class NetMotionDetector:
         decision_window: int   = 50,
         cooldown_frames: int   = 75,
         baseline_window: int   = 60,
+        self_arm_thresh: float = 2.5,
         debug:           bool  = True,
     ):
         self.spike_thresh    = spike_thresh
@@ -68,6 +69,7 @@ class NetMotionDetector:
         self.make_window     = make_window
         self.decision_window = decision_window
         self.cooldown_frames = cooldown_frames
+        self.self_arm_thresh = self_arm_thresh
         self.debug           = debug
 
         # Rolling baseline of net motion during quiet (non-armed) periods
@@ -150,13 +152,21 @@ class NetMotionDetector:
 
         # ── State transitions ─────────────────────────────────────── #
         if self._state == self.IDLE:
-            if armed:
+            # Arm from upstream ShotDetector OR self-arm when net motion
+            # spikes above baseline (handles case where ShotDetector is
+            # unavailable — e.g. no trained weights on this machine).
+            should_arm = armed
+            if not should_arm and net_score is not None and baseline > 0:
+                if net_score > baseline * self.self_arm_thresh and net_score >= self.min_peak * 0.5:
+                    should_arm = True
+            if should_arm:
                 self._state       = self.WATCHING
                 self._watch_count = 0
                 self._spike_count = 0
                 self._peak_score  = 0.0
                 if self.debug:
-                    print(f"[NET] → WATCHING  baseline={baseline:.1f}")
+                    src = "ARMED" if armed else "SELF-ARM"
+                    print(f"[NET] → WATCHING ({src})  baseline={baseline:.1f}  score={net_score}")
 
         elif self._state == self.WATCHING:
             self._watch_count += 1
@@ -281,8 +291,15 @@ class NetMotionDetector:
         global_diff = cv2.absdiff(gray, self._prev_gray).astype(np.float32)
         global_motion = float(np.mean(global_diff))
 
-        # Net-local motion = total motion minus camera shake
-        net_score = max(0.0, net_motion - global_motion)
+        # Net-local motion: use RATIO-based scoring so it works at any fps.
+        # At low fps (4fps), both net_motion and global_motion are large, so
+        # subtraction wipes out real signals.  Ratio preserves them:
+        # if the net moved MORE than the rest of the frame, the ratio > 1.
+        if global_motion > 0.5:
+            net_score = max(0.0, (net_motion / global_motion) - 1.0) * global_motion
+        else:
+            # Very low global motion (static camera) — use raw difference
+            net_score = net_motion
 
         self._prev_gray = gray
         return net_score

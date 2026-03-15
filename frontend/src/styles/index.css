@@ -1,0 +1,32 @@
+@import './fonts.css';
+@import './tailwind.css';
+@import './theme.css';
+
+/* PureArc global overrides */
+html, body, #root {
+  background: #0A0A0A;
+  min-height: 100%;
+  font-family: 'Inter', sans-serif;
+}
+
+/* Smooth scrollbar for dark bg */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #0F0F0F;
+}
+::-webkit-scrollbar-thumb {
+  background: #2A2A2A;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3A3A3A;
+}
+
+/* Selection color */
+::selection {
+  background: rgba(232, 96, 44, 0.3);
+  color: #F2EDE8;
+}

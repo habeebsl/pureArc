@@ -139,6 +139,10 @@ class ReplayAnalysisResponse(BaseModel):
     next_shot_focus: str | None = None
 
 
-class WsEvent(BaseModel):
-    event: str
-    payload: dict[str, Any]
+class VideoAnalysisResponse(BaseModel):
+    session_id: str
+    total_shots: int
+    makes: int
+    shots: list[ShotDetailResponse]
+    drills: list[DrillPlan]
+    summary: str

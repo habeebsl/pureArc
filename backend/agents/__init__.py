@@ -1,13 +1,10 @@
 """Agent clients and payload helpers."""
 
-from .live_coach import LiveCoachClient, build_live_payload
-from .live_coach_async import AsyncLiveCoach, LiveCoachMessage
 from .replay_coach import ReplayCoachClient
+from .video_coach import VideoCoachClient, build_deterministic_drills
 
 __all__ = [
-    "LiveCoachClient",
-    "build_live_payload",
-    "AsyncLiveCoach",
-    "LiveCoachMessage",
     "ReplayCoachClient",
+    "VideoCoachClient",
+    "build_deterministic_drills",
 ]

@@ -1,5 +1,3 @@
-from .ball import BallDetector
-from .rim import RimDetector
 from .pose import PoseEstimator, PoseResult, POSE_CONNECTIONS
 from .release import ReleaseDetector
 from .distance import estimate_distance, draw_distance_overlay
@@ -9,8 +7,6 @@ from .shot_metrics import ShotMetricsEngine, ShotMetrics
 from .mistakes import MistakeEngine, Mistake
 
 __all__ = [
-    "BallDetector",
-    "RimDetector",
     "PoseEstimator",
     "PoseResult",
     "POSE_CONNECTIONS",
